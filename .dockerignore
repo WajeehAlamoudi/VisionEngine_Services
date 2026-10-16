@@ -1,0 +1,18 @@
+**/__pycache__
+**/*.pyc
+.git
+.venv
+venv
+.ruff_cache
+.pytest_cache
+.env*
+config/YAMLs
+config/.generated
+data
+models
+logs
+captures
+# Keep runtime datasets out of image build context.
+collected
+services/*/tests
+tests

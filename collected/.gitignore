@@ -1,0 +1,4 @@
+# Keep runtime datasets local; version only this scaffold.
+*
+!.gitignore
+!.gitkeep

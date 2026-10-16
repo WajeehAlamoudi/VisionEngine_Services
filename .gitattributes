@@ -1,0 +1,8 @@
+# Consistent text files for Windows development and Linux containers.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.mp4 binary

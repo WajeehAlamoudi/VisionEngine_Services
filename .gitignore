@@ -1,0 +1,64 @@
+# Generated pipeline and Compose deployment artifacts
+/.generated/
+/config/.generated/
+
+# Atomic YAML writer temporary files (normally removed automatically)
+.*.yaml.*.tmp
+.*.yml.*.tmp
+
+# Installation-specific configuration; keep reference samples versioned
+/config/YAMLs/*
+!/config/YAMLs/.gitkeep
+/config/**/*.yaml
+/config/**/*.yml
+!/config/config_sample/*.yaml
+!/config/config_sample/*.yml
+
+# Python environments, bytecode, tests, and build output
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+/build/
+/dist/
+
+# Credentials and environment overrides
+.env
+.env.*
+!.env.example
+
+# Runtime output and local model artifacts
+/data/*
+!/data/.gitkeep
+/logs/
+# Collected images, annotations and per-session recovery state.
+/collected/*
+!/collected/.gitkeep
+!/collected/.gitignore
+/captures/
+/models/*
+!/models/.gitkeep
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Local logs, databases and test reports
+*.log
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+.coverage.*
+coverage.xml
+.mypy_cache/
+.tox/
