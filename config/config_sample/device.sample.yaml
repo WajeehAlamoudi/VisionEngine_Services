@@ -1,0 +1,89 @@
+device:
+  # ── identity ────────────────────────────────────────────────────────────────
+  # Unique identifier for this physical device.
+  # This id appears in all logs, heartbeat rows, and health files.
+  # Use a consistent naming convention across deployments.
+  # Example: "node-cenomi-north", "node-warehouse-02", "node-office-lobby"
+  #
+  id: "node-01"
+
+  # Human-readable label for this device.
+  # Shown in dashboard widgets that display node status.
+  #
+  name: "Edge Node 01"
+
+  # Physical location of this device.
+  # Stored in every heartbeat row so the dashboard can show where it is.
+  #
+  location: "Main Entrance - Building A"
+
+  # Runtime environment selects the Docker Compose project name:
+  # visionengine-production-edge or visionengine-development-edge.
+  # It does not change log level or error handling and is not a heartbeat field.
+  # Use log_level below to control logging.
+  #
+  environment: production   # production | development
+
+
+
+  # Maximum number of camera streams this device can run simultaneously.
+  # The pipeline will refuse to start more cameras than this limit.
+  # Set based on your hardware — do not exceed what the device can sustain.
+  #
+  max_cameras: 4
+
+  # Log level for the device process.
+  #   DEBUG   → everything, including frame-level detail (very noisy)
+  #   INFO    → normal operations — stream start/stop, detections, flushes
+  #   WARNING → unexpected but recoverable events
+  #   ERROR   → failures requiring attention
+  #
+  log_level: INFO           # DEBUG | INFO | WARNING | ERROR
+
+  # ── heartbeat ───────────────────────────────────────────────────────────────
+  # The heartbeat pushes one status row to the `nodes` table in the branch schema
+  # at regular intervals. This lets the VisionEngine dashboard show which devices
+  # are online, how many cameras are active, and whether any errors exist.
+  #
+  # The row pushed contains:
+  #   device_id, name, location, status, cameras_active, cameras_error,
+  #   detections_last_minute, buffer_pending, uptime_seconds, ts
+  #
+  heartbeat:
+    enabled: true
+
+    # How often to push a status row to the nodes table.
+    # Lower = faster detection of offline devices on the dashboard.
+    # Higher = less ingest traffic.
+    # Recommended range: 30–300 seconds.
+    #
+    interval_seconds: 60
+
+    # Which table in the branch schema to push heartbeat rows into.
+    # This table must exist in the branch schema before the device starts.
+    # Column names in the pushed row must match the table columns.
+    #
+    table: "nodes"
+
+
+  # ── local health file ───────────────────────────────────────────────────────
+  # The health file is a JSON file written to local disk at regular intervals.
+  # It reflects the current live state of the device without any network call.
+  # Useful for: local monitoring scripts, SSH inspection, watchdog services.
+  #
+  # Contents: status, uptime, per-camera status + fps + detection count,
+  #           buffer stats, last flush timestamp.
+  #
+  health_file:
+    enabled: false
+
+    # Where to write the health file on disk.
+    # /tmp is appropriate — this file is ephemeral and recreated on restart.
+    #
+    path: "/tmp/visionengine-edge-health.json"
+
+    # How often to update the health file.
+    # This is independent from the heartbeat interval.
+    # Recommended: shorter than heartbeat — gives faster local feedback.
+    #
+    interval_seconds: 30

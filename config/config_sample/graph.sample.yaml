@@ -1,0 +1,230 @@
+# Graph template schema v1. Declares planned connections, not running services.
+graph:
+  version: 1
+
+  # Port contracts are declarative here; executable service adapters come later.
+  services:
+    camera:
+      inputs: {}
+      outputs: {frames: frame.v1}
+
+    inference:
+      inputs: {frames: frame.v1}
+      outputs: {detections: detections.v1, annotated_frames: frame.v1}
+
+    tracking:
+      inputs: {frames: frame.v1, detections: detections.v1}
+      required_inputs: [detections]
+      outputs: {tracks: detections.v1}
+
+    enrichment:
+      inputs: {detections: detections.v1}
+      outputs: {events: event.v1}
+
+    rules:
+      inputs: {events: event.v1}
+      outputs: {accepted: event.v1, alerts: alert.v1}
+
+    row_builder:
+      inputs: {events: event.v1, alerts: alert.v1, monitor: health.v1}
+      required_inputs: [events]
+      outputs: {rows: rows.v1}
+
+    buffer:
+      inputs: {rows: rows.v1}
+      outputs: {pending: buffer.batch.v1, status: buffer.status.v1}
+
+    ingest:
+      inputs: {rows: buffer.batch.v1}
+      outputs: {status: ingest.status.v1}
+
+    notifier:
+      inputs: {alerts: alert.v1}
+      outputs: {status: notifier.status.v1}
+
+    collector:
+      inputs: {frames: frame.v1, detections: detections.v1}
+      outputs: {status: collector.status.v1}
+
+    monitor:
+      inputs: {}
+      outputs: {health: health.v1}
+
+  profiles:
+    # Independent raw-frame cache for delayed inference/result matching.
+    collection_frames:
+      max_items: 64
+      max_bytes: 67108864
+      max_age_ms: 5000
+      overflow: drop_oldest
+      ordering: camera
+
+    live:
+      max_items: 2
+      max_bytes: 16777216
+      max_age_ms: 500
+      overflow: drop_oldest
+      ordering: camera
+
+    # Retain original frames long enough to join delayed inference results.
+    tracking_frames:
+      max_items: 64
+      max_bytes: 67108864
+      max_age_ms: 5000
+      overflow: drop_oldest
+      ordering: camera
+
+    results:
+      max_items: 32
+      max_bytes: 4194304
+      max_age_ms: 5000
+      overflow: drop_oldest
+      ordering: camera
+
+    rows:
+      max_items: 1000
+      max_bytes: 4194304
+      max_age_ms: null
+      overflow: block
+      ordering: none
+
+  nodes:
+
+    - id: "camera/{camera.id}"
+      service: camera
+      for_each: enabled_cameras
+      config_refs: {camera: "cameras/{camera.id}"}
+
+    - id: "inference/{model.id}"
+      service: inference
+      for_each: used_models
+      config_refs: {model: "models/{model.id}"}
+
+    - id: "tracking/{camera.id}"
+      service: tracking
+      for_each: tracked_cameras
+      config_refs:
+        camera: "cameras/{camera.id}"
+        model: "models/{camera.model_id}"
+        tracker: "tracker_for/{camera.id}"
+
+    - id: "enrichment/{camera.id}"
+      service: enrichment
+      for_each: enabled_cameras
+      config_refs: {camera: "cameras/{camera.id}"}
+
+    - id: rules
+      service: rules
+      config_refs: {rules: rules}
+
+    - id: row_builder
+      service: row_builder
+      config_refs: {cameras: cameras, rules: rules, device: device}
+
+    - id: buffer
+      service: buffer
+      config_refs: {buffer: api/buffer}
+
+    - id: ingest
+      service: ingest
+      config_refs: {api: api}
+
+    - id: notifier
+      service: notifier
+      when: notifications_enabled
+      config_refs: {notifications: notifications}
+
+    - id: "collector/{session.id}"
+      service: collector
+      for_each: enabled_collection_sessions
+      config_refs: {session: "sessions/{session.id}", camera: "cameras/{session.camera}", collection: collection}
+
+    - id: monitor
+      service: monitor
+      config_refs: {device: device}
+
+  edges:
+
+    - id: "capture/{camera.id}"
+      for_each: enabled_cameras
+      from: "camera/{camera.id}.frames"
+      to: "inference/{camera.model_id}.frames"
+      profile: live
+
+    - id: "tracking_frames/{camera.id}"
+      for_each: tracked_cameras
+      when: tracking_requires_frame
+      from: "camera/{camera.id}.frames"
+      to: "tracking/{camera.id}.frames"
+      profile: tracking_frames
+
+    - id: "tracking_detections/{camera.id}"
+      for_each: tracked_cameras
+      from: "inference/{camera.model_id}.detections"
+      to: "tracking/{camera.id}.detections"
+      select: {camera_id: "{camera.id}"}
+      profile: results
+
+    - id: "tracked_enrichment/{camera.id}"
+      for_each: tracked_cameras
+      from: "tracking/{camera.id}.tracks"
+      to: "enrichment/{camera.id}.detections"
+      profile: results
+
+    - id: "untracked_enrichment/{camera.id}"
+      for_each: untracked_cameras
+      from: "inference/{camera.model_id}.detections"
+      to: "enrichment/{camera.id}.detections"
+      select: {camera_id: "{camera.id}"}
+      profile: results
+
+    - id: "rules/{camera.id}"
+      for_each: enabled_cameras
+      from: "enrichment/{camera.id}.events"
+      to: rules.events
+      profile: results
+
+    - id: accepted_rows
+      from: rules.accepted
+      to: row_builder.events
+      profile: results
+
+    - id: notification_rows
+      from: rules.alerts
+      to: row_builder.alerts
+      profile: results
+
+    # Logical connection; deployment records it as pending until monitor exists.
+    - id: monitor_rows
+      from: monitor.health
+      to: row_builder.monitor
+      profile: results
+
+    - id: buffer_rows
+      from: row_builder.rows
+      to: buffer.rows
+      profile: rows
+
+    - id: ingest_rows
+      from: buffer.pending
+      to: ingest.rows
+      profile: rows
+
+    - id: notify
+      when: notifications_enabled
+      from: rules.alerts
+      to: notifier.alerts
+      profile: results
+
+    - id: "collection_frames/{session.id}"
+      for_each: enabled_collection_sessions
+      from: "camera/{session.camera}.frames"
+      to: "collector/{session.id}.frames"
+      profile: collection_frames
+
+    - id: "collection_results/{session.id}"
+      for_each: enabled_collection_sessions
+      from: "inference/{camera.model_id}.detections"
+      to: "collector/{session.id}.detections"
+      select: {camera_id: "{session.camera}"}
+      profile: results

@@ -1,0 +1,84 @@
+api:
+  # ── identity ────────────────────────────────────────────────────────────────
+  # The branch this edge device belongs to.
+  # Must exactly match the branch_id in the VisionEngine backend.
+  # Included in every alert webhook payload and ingest request for routing.
+  #
+  branch_id: YOUR_BRANCH_ID
+
+  # ── authentication ──────────────────────────────────────────────────────────
+  # The API key for the branch this device belongs to.
+  # Generated in the VisionEngine dashboard under Branch Settings → API Key.
+  # Sent as the X-API-Key header on every ingest and webhook request.
+  #
+  # NEVER commit a real key to git.
+  # Use YOUR_VALUE_HERE as a placeholder and fill it in after cloning.
+  #
+  key: YOUR_VALUE_HERE
+
+  # Base URL of the VisionEngine backend.
+  # All API paths are appended to this — do not include a trailing slash.
+  # Example: https://your-app.ondigitalocean.app/api/v1
+  #
+  url: YOUR_VALUE_HERE
+
+
+  # ── ingest behaviour ────────────────────────────────────────────────────────
+  # Controls how rows are batched and pushed to the /branches/ingest endpoint.
+  # Two flush triggers — whichever comes first wins:
+  #
+  #   batch_size             push when this many rows are buffered
+  #                          higher = fewer HTTP requests under heavy detection load
+  #                          lower  = rows appear on the dashboard sooner
+  #
+  #   flush_interval_seconds push after this many seconds even if batch is not full
+  #                          safety net for quiet cameras — ensures rows are not
+  #                          stuck waiting for the batch to fill
+  #                          example: 1 detection/min still gets pushed within 30s
+  #
+  ingest:
+    batch_size: 50
+    flush_interval_seconds: 30
+
+
+  # ── local buffer ────────────────────────────────────────────────────────────
+  # Detection rows are written to a local SQLite database before being pushed
+  # to the ingest API. If the API is unreachable, rows stay in the buffer and
+  # are retried automatically. Rows are retained until delivery or configured capacity eviction.
+  #
+  buffer:
+    # Path to the SQLite database file.
+    # Use a persistent location — not /tmp — so the buffer survives reboots.
+    #
+    path: "./data/buffer.db"
+
+    # Maximum disk space the buffer database is allowed to use.
+    # When this limit is reached, the oldest unsent rows are deleted to make room.
+    #
+    max_size_mb: 200
+
+    # Base wait time between retries after a failed push.
+    # Uses exponential backoff — delay grows up to 5× this value on repeated
+    # failures, then resets when a push succeeds.
+    #
+    retry_interval_seconds: 10
+
+    # How long to keep rows that were successfully sent before deleting them.
+    # Set to 0 to delete immediately after a successful push.
+    #
+    delete_after_hours: 24
+
+
+  # ── request settings ────────────────────────────────────────────────────────
+  # Controls HTTP request behaviour when calling the VisionEngine API.
+  #
+  request:
+    # Seconds to wait for a response before treating the request as failed.
+    # Rows stay in the buffer and are retried on the next flush.
+    #
+    timeout_seconds: 10
+
+    # Maximum number of consecutive failures before the ingest worker pauses
+    # and waits for a longer backoff period before retrying.
+    #
+    max_consecutive_failures: 5

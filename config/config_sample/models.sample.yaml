@@ -1,0 +1,205 @@
+models:
+  # ── model registry ──────────────────────────────────────────────────────────
+  # Defines every model available on this device.
+  # Cameras in cameras.yaml reference a model by its id.
+  #
+  # This file is the single source of truth for what each model can detect.
+  # It does NOT define which camera uses which model — that is in cameras.yaml.
+  # It does NOT define which classes to watch per camera — that is in cameras.yaml.
+  #
+  # Separation rule:
+  #   models.yaml  → what the model IS CAPABLE of detecting (its full class list)
+  #   cameras.yaml → what THIS CAMERA should actually watch (a subset filter)
+  #
+  # At startup the pipeline validates:
+  #   - Every camera's model_id exists in this file
+  #   - Every class listed on a camera exists in that model's classes list
+  #   - A mismatch causes a clear startup error and the device will not run
+  #     Example: "cam-02 lists class 'hardhat' but model 'vehicle_detector'
+  #               only knows: car, truck, bus, motorcycle, bicycle"
+  #
+  # Fields:
+  #
+  #   id          Unique model identifier. Referenced by cameras.yaml.
+  #               Convention: descriptive lowercase with underscores.
+  #               Example: person_detector, vehicle_detector, general_coco
+  #
+  #   name        Human-readable label for logs and health reports.
+  #
+  #   version     Model version string. Shown in health reports so you can
+  #               track which version is deployed on each device from the dashboard.
+  #               Increment this when you retrain or update weights.
+  #
+  #   path        Path to the model weights file.
+  #               Relative to the project root, or absolute.
+  #               Convention: store all model files in ./models/
+  #
+  #               Formats and hardware compatibility are checked by the installed
+  #               Ultralytics backend at service startup/first prediction.
+  #               Examples include .pt, .onnx, .engine and exported directories.
+  #               Place real assets here; the service does not download weights.
+  #
+  #   runtime     ultralytics. This project uses OpenCV camera capture and a
+  #               separate object-detection service. DeepStream is out of scope.
+  #
+  #   accelerator Native Ultralytics device selector, for example:
+  #               auto      let Ultralytics choose (no device override)
+  #               cpu       CPU execution
+  #               cuda:0    first NVIDIA GPU, with compatible Torch and drivers
+  #               '0'       equivalent numeric GPU selector; quote it in YAML
+  #               mps       Apple Metal on native macOS
+  #               coreml    compatibility alias for a CoreML model on macOS;
+  #                         does not force Neural Engine execution
+  #               Other selectors supported by the installed backend are accepted.
+  #               Format, dependencies and hardware must match. Linux Docker does
+  #               not provide Apple MPS/CoreML; Jetson needs a compatible runtime.
+  #
+  #   classes     The classes this deployment expects from this model. Names
+  #               must match exactly what the model outputs, and cameras may
+  #               only reference classes listed here.
+  #
+  #               This is normally a narrowed set, not the model's full 80-class
+  #               COCO list — declare the classes you actually use. Treat it as
+  #               a contract: if someone deploys the wrong weights file, the
+  #               declared classes will not match and startup fails.
+  #
+  #               Required, non-empty, no duplicates. "*" is NOT accepted here:
+  #               this list is the source of truth that camera class filters are
+  #               validated against, and resolving "*" would mean loading the
+  #               model before the config could be checked.
+  #
+  #               For standard YOLOv8 / YOLO11 pretrained on COCO 80 classes:
+  #                 person, bicycle, car, motorcycle, airplane, bus, train, truck,
+  #                 boat, chair, bottle, cup, laptop, cell phone, and 66 more.
+  #                 Full list: https://github.com/ultralytics/ultralytics/blob/main/ultralytics/cfg/datasets/coco.yaml
+  #
+  #               For custom fine-tuned models: use your training config class names.
+  #
+  #   confidence_threshold
+  #               Discard detections below this score. Range 0.0 – 1.0.
+  #               This is the model-level floor — rules in rules.yaml can set
+  #               a HIGHER threshold per rule via min_confidence.
+  #               Cameras cannot override this — use a rule scoped to that
+  #               camera instead.
+  #
+  #   iou_threshold
+  #               Intersection over Union for Non-Maximum Suppression.
+  #               Removes duplicate bounding boxes for the same object.
+  #               Range 0.0 – 1.0. Lower = more aggressive deduplication.
+  #               Recommended: 0.45. Rarely needs changing.
+  #
+  #   input_size  [width, height] in pixels. Frame is resized to this before inference.
+  #               Must match what the model was trained with.
+  #               Standard YOLO sizes: [320,320] (fast), [640,640] (balanced), [1280,1280] (accurate)
+  #
+  #   use_tracker Plans a separate tracker node per camera when true.
+  #               Inference always shares one stateless model per model_id,
+  #               calls predict(), and emits track_id: null. Tracking will assign
+  #               IDs downstream; that service is not implemented yet.
+  #
+  #   tracker     Tracker configuration path, for example config/boxmot_tracker.yaml.
+  #               Validated by the configuration controller; inference does not
+  #               load tracker state or tracker dependencies.
+  #
+  #   half        FP16 inference — true = run the model at half precision.
+  #               Only takes effect when device resolves to cuda (a real GPU);
+  #               on cpu/mps it's silently ignored since it gives no speedup
+  #               there (sometimes even slower). On a supported GPU (e.g.
+  #               Jetson Orin), roughly halves inference time with negligible
+  #               accuracy loss. Has no effect on a TensorRT .engine file —
+  #               its precision is already fixed at export time.
+  #               Default: false.
+
+
+  # ── model 1: general purpose — full COCO pretrained ─────────────────────────
+  # Use this for most deployments. Detects people, vehicles, and common objects.
+  # No fine-tuning — straight pretrained weights.
+
+  - id: general_coco
+    name: "YOLOv8 General COCO"
+    version: "1.0.0"
+    path: "./models/yolov8n.pt"
+    runtime: ultralytics
+    accelerator: auto
+    classes:
+      - person
+      - bicycle
+      - car
+      - motorcycle
+      - bus
+      - truck
+    confidence_threshold: 0.5
+    iou_threshold: 0.45
+    input_size: [640, 640]
+    use_tracker: false
+    tracker: "config/boxmot_tracker.yaml"
+    half: false
+
+
+  # ── model 2: person-only fine-tuned ─────────────────────────────────────────
+  # Fine-tuned on mall/indoor environments for person detection only.
+  # Higher accuracy than general model for this specific use case.
+
+  - id: person_detector
+    name: "Person Detector — Mall Fine-Tuned"
+    version: "1.0.0"
+    path: "./models/person_mall_v1.pt"
+    runtime: ultralytics
+    accelerator: auto
+    classes:
+      - person
+    confidence_threshold: 0.6
+    iou_threshold: 0.45
+    input_size: [640, 640]
+    use_tracker: false
+    tracker: "config/boxmot_tracker.yaml"
+    half: false
+
+
+  # ── model 3: vehicle-only ────────────────────────────────────────────────────
+  # Optimised for outdoor parking and road scenes.
+
+  - id: vehicle_detector
+    name: "Vehicle Detector"
+    version: "1.0.0"
+    path: "./models/vehicle_v1.pt"
+    runtime: ultralytics
+    accelerator: auto
+    classes:
+      - car
+      - truck
+      - bus
+      - motorcycle
+      - bicycle
+    confidence_threshold: 0.55
+    iou_threshold: 0.45
+    input_size: [640, 640]
+    use_tracker: false
+    tracker: "config/boxmot_tracker.yaml"
+    half: false
+
+
+  # ── model 4: CoreML compiled (Mac Mini M-series) ────────────────────────────
+  # CoreML export for native macOS execution. Available compute units depend
+  # on the backend and host; the accelerator alias does not force Neural Engine.
+  # half is omitted for this backend.
+
+  - id: general_coco_coreml
+    name: "YOLOv8 General COCO — CoreML"
+    version: "1.0.0"
+    path: "./models/yolov8n.mlpackage"
+    runtime: ultralytics
+    accelerator: coreml
+    classes:
+      - person
+      - bicycle
+      - car
+      - motorcycle
+      - bus
+      - truck
+    confidence_threshold: 0.5
+    iou_threshold: 0.45
+    input_size: [640, 640]
+    use_tracker: false
+    tracker: "config/boxmot_tracker.yaml"
+    half: false

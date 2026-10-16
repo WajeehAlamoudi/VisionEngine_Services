@@ -1,0 +1,185 @@
+notifications:
+  # ── what notifications do ───────────────────────────────────────────────────
+  # Notifications define WHERE to send an alert when a rule fires.
+  # Rules in rules.yaml decide WHAT is worth alerting on.
+  # Notifications only define the delivery channel — not the conditions.
+  #
+  # Every rule match goes through ALL enabled channels simultaneously.
+  # One channel failing does not block the others.
+  #
+  # Supported channels:
+  #   log       → writes a structured line to the device log (when enabled)
+  #   webhooks  → sends an HTTP POST with the alert payload as JSON
+  #   emails    → sends a plain-text alert and its JSON details through SMTP
+  #
+  # Webhook payload sent on each alert:
+  # {
+  #   "rule_name":     "person_restricted_area",
+  #   "severity":      "critical",
+  #   "message":       "Person detected in restricted area: server_room",
+  #   "branch_id":     "...",
+  #   "device_id":     "node-mall-01",
+  #   "camera_id":     "cam-01",
+  #   "camera_name":   "Main Entrance",
+  #   "model_id":      "person_detector",
+  #   "track_id":      null,
+  #   "class":         "person",
+  #   "confidence":    0.91,
+  #   "zone":          "server_room",
+  #   "bbox_x1": 120,  "bbox_y1": 80,  "bbox_x2": 260,  "bbox_y2": 420,
+  #   "anchor_x": 190.0,       "anchor_y": 420.0,
+  #   "anchor_x_norm": 0.297,  "anchor_y_norm": 0.875,
+  #   "frame_w": 640,  "frame_h": 480,
+  #   "ts":            "2026-06-22T08:14:33Z"
+  # }
+
+
+  # ── log channel ─────────────────────────────────────────────────────────────
+  # Writes every alert as a structured log line on the device.
+  # Always fast — no network call. Use as a baseline even if webhooks are enabled.
+  # Visible via: docker compose -f config/.generated/pipeline.compose.yaml logs -f visionengine-notifier-service
+  #
+  # The log channel is never filtered: it is the full audit trail of every rule
+  # that fired. Per-rule routing applies to webhooks and email channels.
+  #
+  log:
+    enabled: true
+
+
+  # ── webhook channels ────────────────────────────────────────────────────────
+  # Any number of webhooks can be defined, including none — an empty list is a
+  # valid configuration that delivers alerts to the log only.
+  # Each fires independently — one failure does not block the others, and no
+  # webhook failure ever blocks the pipeline or the ingest path.
+  #
+  # Fields:
+  #   name       Label used in logs to identify which webhook fired or failed.
+  #              Letters, digits, hyphens, underscores. Must be unique.
+  #
+  #   url        Full HTTP/HTTPS URL to POST the alert payload to.
+  #              Required and validated even when enabled: false, so enabling a
+  #              webhook later cannot silently fail against a placeholder.
+  #              If you have no URL yet, comment the whole entry out.
+  #
+  #   enabled    true/false — disable without deleting.
+  #
+  #   timeout_seconds
+  #              Seconds to wait for a response before treating as failed.
+  #              Failed webhooks are logged and dropped — never retried. The
+  #              notifications TABLE is populated separately through the durable
+  #              ingest path, so a webhook outage loses live alerts, not rows.
+  #
+  #   rules      Which rules this webhook fires for.
+  #                "*"                  → every rule
+  #                [rule_a, rule_b]     → only these rules, by name from rules.yaml
+  #              An empty list [] is rejected — write "*" if you mean all.
+  #              A name that does not exist in rules.yaml is a startup error.
+  #
+  #   severities Which severities this webhook fires for.
+  #                "*"                  → every severity
+  #                [critical, warning]  → only these
+  #              An empty list [] is rejected — write "*" if you mean all.
+  #
+  #   rules and severities are AND-ed: a match must satisfy both filters.
+  #   This is how you route by importance — a pager webhook takes only
+  #   critical, while the dashboard webhook takes everything.
+
+
+  webhooks:
+
+    # VisionEngine backend — receives notifications and broadcasts them to the
+    # frontend over WebSocket. Set url to {api.url}/notifications/webhook
+    # (the same base as your ingest URL). The edge authenticates with the
+    # X-API-Key from api.yaml — no extra config needed.
+    - name: visionengine
+      url: "https://your-backend.example.com/api/v1/notifications/webhook"
+      enabled: false
+      timeout_seconds: 5
+      rules: "*"
+      severities: "*"
+
+    # Pager / on-call — critical alerts only, regardless of which rule fired.
+    # - name: pager
+    #   url: "https://hooks.example.com/services/XXX/YYY/ZZZ"
+    #   enabled: false
+    #   timeout_seconds: 5
+    #   rules: "*"
+    #   severities: [critical]
+
+    # A single-purpose integration — one rule, any severity.
+    # - name: restricted_area_alerts
+    #   url: "https://hooks.example.com/services/AAA/BBB/CCC"
+    #   enabled: false
+    #   timeout_seconds: 5
+    #   rules: [person_restricted_area]
+    #   severities: "*"
+
+
+  # ── email channels ──────────────────────────────────────────────────────────
+  # Each enabled channel sends one email for each matching alert from rules.
+  # The email contains a readable summary and the full alert JSON.
+  # Delivery is live-only: failures are counted, not retried or persisted.
+  # Database notification rows use the separate row builder/buffer/ingest path.
+  #
+  # Setup:
+  #   1. Replace the SMTP host, username, sender and recipient addresses below.
+  #   2. Set the password environment variable named by password_env.
+  #      PowerShell: $env:VISIONENGINE_SMTP_PASSWORD = "your-smtp-password"
+  #      CMD:        set VISIONENGINE_SMTP_PASSWORD=your-smtp-password
+  #      Or use a Git-ignored .env file and pass --env-file .env to Compose.
+  #   3. Set enabled: true, generate the configuration, then start notifier.
+  #      Never put the actual password in this YAML or commit it to Git.
+  #
+  # Fields:
+  #   name             Unique channel label, across both emails and webhooks.
+  #   enabled          Keep false until the SMTP settings are ready.
+  #   smtp.host        SMTP hostname or IP; no smtp:// prefix.
+  #   smtp.port        Provider's SMTP port.
+  #   smtp.security    starttls: require a TLS upgrade, usually port 587.
+  #                    ssl: TLS from connection start, usually port 465.
+  #                    none: unauthenticated local relay, usually port 25.
+  #                    Server certificates are verified for starttls/ssl.
+  #   smtp.username    Provider's SMTP login; may differ from from_address.
+  #   smtp.password_env
+  #                    Environment variable NAME containing the SMTP password.
+  #                    Required at startup only when this channel is enabled.
+  #                    For an unauthenticated relay, set both username and
+  #                    password_env to null. Login requires starttls or ssl.
+  #   from_address     Sender address permitted by your SMTP provider.
+  #   to               List of 1..50 recipient addresses; no display names.
+  #   subject_prefix   Fixed prefix added to severity, rule and camera name.
+  #   timeout_seconds  Total send deadline, from 1 to 300 seconds.
+  #   rules            "*" or a list of rule names declared in rules.yaml.
+  #   severities       "*" or a list containing info, warning and/or critical.
+  #                    Both filters must match; empty filter lists are invalid.
+  #
+  # Rules owns cooldown_seconds; notifier does not add a second cooldown.
+  # Use emails: [] instead of this list when no email channels are needed.
+
+  emails:
+
+    # Authenticated SMTP with STARTTLS.
+    - name: security_email
+      enabled: false
+
+      smtp:
+        host: smtp.example.com
+        port: 587
+        security: starttls
+        username: alerts@example.com
+        password_env: VISIONENGINE_SMTP_PASSWORD
+
+      from_address: alerts@example.com
+      to:
+        - security@example.com
+        - supervisor@example.com
+
+      subject_prefix: "[VisionEngine]"
+      timeout_seconds: 10
+      rules: "*"
+      severities: [warning, critical]
+
+    # Direct TLS alternative: use port: 465 and security: ssl above.
+    # To limit delivery to specific rules, replace rules: "*" with, for example:
+    # rules: [person_restricted_area]
+    # The selected rule must exist and have notify: true to produce alerts.

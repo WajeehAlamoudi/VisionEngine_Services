@@ -1,0 +1,196 @@
+cameras:
+  # ── camera definition ───────────────────────────────────────────────────────
+  # Each entry defines one camera stream processed by this edge device.
+  # Cameras are processed in parallel — each runs its own pipeline independently.
+  #
+  # Fields:
+  #
+  #   id          Unique identifier for this camera.
+  #               Used in logs, detection rows, alert rows, and health reports.
+  #               Must be unique across all cameras on this device.
+  #               Convention: cam-01, cam-entrance, cam-parking-north
+  #
+  #   name        Human-readable label shown in logs and dashboard.
+  #
+  #   source      Camera input source. Three supported formats:
+  #                 0, 1, 2 ...       USB/built-in camera by index (0 = first camera)
+  #                 rtsp://...        RTSP stream URL (IP cameras, NVRs)
+  #                 /path/to/file.mp4 Video file (for testing without a real camera)
+  #
+  #               How the source is opened depends on the runtime of the
+  #               model this camera is bound to. The ultralytics runtime
+  #               reads all three with OpenCV. The deepstream runtime reads
+  #               URIs through NVDEC and cannot open a USB index — a camera
+  #               on a bare integer is refused at startup with that
+  #               explanation, and needs runtime: ultralytics instead.
+  #
+  #   enabled     true  → camera pipeline starts on device boot
+  #               false → camera is defined but not started
+  #                       use this to temporarily disable a camera without removing it
+  #
+  #   fps_target  Inference FPS for this camera only.
+  #               Overrides the device-level fps_target from device.yaml.
+  #               Omit to inherit the device default.
+  #
+  # ── model binding (links this camera to models.yaml) ─────────────────────────
+  #
+  #   model_id    Which model to use for this camera.
+  #               Must exactly match an id in models.yaml.
+  #               Omit to use the first model defined in models.yaml.
+  #
+  #               At startup the pipeline validates that this id exists in models.yaml.
+  #               If it does not exist → startup error, device will not run.
+  #               Example error: "cam-02: model_id 'vehicle_v2' not found in models.yaml"
+  #
+  # ── class filter (per-camera subset of the model's classes) ──────────────────
+  #
+  #   classes     Which classes to process from this camera's model output.
+  #               Must be a subset of the classes list in the referenced model.
+  #               Use "*" to process ALL classes the model can detect.
+  #               An empty list [] is rejected — write "*" if you mean all.
+  #
+  #               At startup the pipeline validates each class against the model.
+  #               If a class is not in the model → startup error, device will not run.
+  #               Example error: "cam-01: class 'hardhat' not in model 'general_coco'
+  #                               (known: person, bicycle, car, motorcycle, bus, truck)"
+  #
+  #               Use this when:
+  #               - You want vehicle detections stored but only alert on trucks (narrow rules)
+  #               - A camera only covers a pedestrian zone — no point processing car detections
+  #               - You're using a general model but only one class is relevant for this camera
+  #
+  # ── tables ────────────────────────────────────────────────────────────────────
+  #
+  #   raw_table   Single table for all detections from this camera.
+  #               One row per detection event.
+  #               Use this when all classes go to the same place.
+  #               Omit if using routing instead.
+  #
+  #   routing     Class-based table routing — alternative to raw_table.
+  #               Use when different classes should go to different tables
+  #               (e.g. different teams, different retention policies, different dashboards).
+  #               Evaluated top-to-bottom — first matching entry wins.
+  #               Each entry has:
+  #                 classes     list of class names this entry handles
+  #                             classes: "*" means ALL classes (universal convention — see below)
+  #                             placed last, it naturally covers anything not matched above
+  #                 raw_table   table to write matching detections into
+  #
+  #               Universal convention — "*" always means ALL:
+  #                 zones: "*"           → full frame, no subdivision
+  #                 classes: "*"         → all classes the model can detect
+  #                 routing classes: "*" → all classes (fallback when placed last)
+  #               This convention is consistent across every config file in this
+  #               project. An empty list [] is always rejected: "*" is a decision,
+  #               [] is usually an accident.
+  #
+  #               Rules:
+  #               - Use raw_table OR routing — not both on the same camera
+  #               - Every active class should be covered — unmatched detections are
+  #                 logged as a warning and skipped
+  #               - Add a classes: "*" entry last to ensure nothing is silently dropped
+  #               - Startup validation warns if any active class has no routing entry
+  #
+  #               Example — person and vehicles to separate tables:
+  #                 routing:
+  #                   - classes: [person]
+  #                     raw_table: "person_detections"
+  #                   - classes: [car, truck]
+  #                     raw_table: "vehicle_detections"
+  #                   - classes: "*"            # all remaining classes → default table
+  #                     raw_table: "detections"
+  #
+  # ── zones ─────────────────────────────────────────────────────────────────────
+  #
+  #   zones       List of detection zones for this camera.
+  #               Each zone is a named polygon in pixel coordinates.
+  #               Detections are tagged with the zone name they fall into.
+  #               If a detection falls outside all defined zones → tagged "unzoned".
+  #               Use "*" for no zone subdivision — the whole frame is accepted
+  #               and everything is tagged "full_frame".
+  #               An empty list [] is rejected — write "*" if you mean full frame.
+  #
+  #               Zone fields:
+  #                 name      Referenced by rules.yaml to target this zone for alerts.
+  #                           Use underscores — e.g. main_entrance not "main entrance"
+  #                 polygon   List of [x, y] pixel coordinates forming a closed polygon.
+  #                           Minimum 3 points. Coordinates are relative to the camera
+  #                           frame resolution (e.g. [0,0] is top-left, [640,480] is bottom-right).
+  #                           Use tools/debug.py --mode zones to draw zones interactively.
+  #
+  # ── tracker ───────────────────────────────────────────────────────────────────
+  #
+  #   use_tracker true  → selected BoxMOT tracker enabled — track_id populated,
+  #                        allowing you to follow the same person across frames.
+  #                        Each camera with use_tracker: true gets its own dedicated
+  #                        model instance (tracker state cannot be shared).
+  #               false → stateless predict — track_id is always null (default).
+  #                        Cameras sharing the same model_id share one model instance.
+  #
+  #   Tracker algorithm is set device-wide via tracker: in device.yaml.
+  #   Built-ins (no download needed): "botsort.yaml" | "bytetrack.yaml"
+
+
+  # ── case 1: entrance camera — single table (simple) ─────────────────────────
+  # Person-only model. One raw_table — all detections go to the same place.
+  # Use this pattern when you don't need to separate classes into different tables.
+
+  - id: cam-01
+    name: "Main Entrance"
+    source: 0                         # USB device index — unquoted integer
+    enabled: true
+    fps_target: 5
+    model_id: person_detector         # → models.yaml id: person_detector
+    classes: [person]
+    raw_table: "person_detections"
+    zones:
+      # Evaluated in order — first match wins, so specific zones must come
+      # before any that overlap them. main_entrance covers the whole frame,
+      # so it goes last and acts as the catch-all.
+      - name: server_room
+        polygon: [[0,0],[200,0],[200,240],[0,240]]
+      - name: back_office
+        polygon: [[200,0],[440,0],[440,240],[200,240]]
+      - name: main_entrance
+        polygon: [[0,0],[640,0],[640,480],[0,480]]
+
+
+  # ── case 2: parking lot — routing (class-based table split) ─────────────────
+  # General model detecting both persons and vehicles.
+  # Persons → person_detections (security/operations team)
+  # Vehicles → vehicle_detections (parking analytics team)
+  # Uses routing instead of raw_table.
+
+  - id: cam-02
+    name: "Parking Lot"
+    source: "rtsp://YOUR_CAMERA_IP/stream1"
+    enabled: true
+    fps_target: 3
+    model_id: general_coco
+    classes: [person, car, truck]     # all three are active for this camera
+    routing:
+      - classes: [person]
+        raw_table: "person_detections"
+      - classes: [car, truck]
+        raw_table: "vehicle_detections"
+      # no catch-all needed — all active classes above are covered
+    zones:
+      - name: parking_zone_a
+        polygon: [[0,0],[320,0],[320,480],[0,480]]
+      - name: parking_entrance
+        polygon: [[320,0],[640,0],[640,480],[320,480]]
+
+
+  # ── case 3: lobby — every class the model knows, whole frame ────────────────
+  # classes: "*" → every class general_coco can detect.
+  # zones: "*"   → no zone subdivision; everything is tagged "full_frame".
+
+  - id: cam-03
+    name: "Lobby Overview"
+    source: "rtsp://YOUR_CAMERA_IP/stream2"
+    enabled: true
+    fps_target: 5
+    model_id: general_coco
+    classes: "*"
+    raw_table: "detections"
+    zones: "*"

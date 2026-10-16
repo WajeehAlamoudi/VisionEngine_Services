@@ -1,0 +1,112 @@
+collection:
+  # Dataset collection observes existing camera frames and direct inference results.
+  # It does not open another camera connection or subscribe to annotated previews.
+  # One container is generated per enabled session.
+  #
+  # Dataset layout (matching filenames are paired automatically by YOLO tools):
+  #   collected/<session_id>/
+  #     data.yaml                    Stable class ID -> class name mapping
+  #     images/<sample_id>.jpg       Original clean frame, JPEG encoded
+  #     labels/<sample_id>.txt       Separate YOLO labels, one object per line
+  #     metadata/<sample_id>.json    Only when save.metadata is true
+  #     .collector.sqlite3           Internal write journal / persistent count
+  #     .collector.lock              Single-writer lock; keep internal state local
+  #
+  # YOLO label line: class_id center_x center_y width height (normalized 0..1).
+  # IDs follow the camera model's classes list, recorded in data.yaml.
+  # Eligible interval/random samples with zero detections get an empty label file.
+  # Labels are model-generated suggestions; review them in your annotation tool.
+  # No boxes, labels or optional previews are drawn into the saved JPEG.
+
+  # Host storage root. Relative paths resolve from the independent project root.
+  # Compose mounts it at /data/collected inside every collector container.
+  # Files and internal state survive image rebuilds and container replacement.
+  # ./collected is excluded by .gitignore and .dockerignore.
+  # For a custom directory, also exclude it from your Docker build context.
+  output_dir: "./collected"
+
+  # An empty list disables collection; an entirely blank file also means off.
+  sessions: []
+
+  # Session fields:
+  #   id          Unique session/folder name: letters, digits, hyphens, underscores.
+  #   camera      Enabled camera ID from cameras.yaml.
+  #   enabled     false excludes this session from the generated deployment.
+  #
+  #   schedule    UTC at frame capture time; null means no limit. Date endpoints are inclusive.
+  #     after / before          HH:MM; before must be later than after.
+  #     start_date / end_date   YYYY-MM-DD; overnight windows are not supported.
+  #
+  #   sampling
+  #     mode              interval | on_detection | random
+  #     interval_seconds  Positive integer for interval; null otherwise.
+  #     frames_per_minute Positive integer for random; null otherwise.
+  #     interval saves no faster than the configured interval after a successful save.
+  #     random chooses one next interval between 0.5 and 1.5 times 60 / rate.
+  #     on_detection requires at least one qualifying detection.
+  #
+  #   filters
+  #     classes         "*" or a list of classes active on this camera; not [].
+  #     min_confidence  0..1, inclusive threshold.
+  #     min_detections  Minimum qualifying detections; 0 permits background samples
+  #                     for interval/random modes. Only qualifying objects are labeled.
+  #
+  #   save
+  #     annotated  Must be false. Kept as a compatibility field; no preview output.
+  #     raw        Must be true. Each label file is paired with a clean image.
+  #     metadata   Optional JSON sidecar; YOLO label files are always written.
+  #
+  #   max_frames  Total committed samples for this session, including previous runs.
+  #               0 = unlimited. Reaching the limit leaves the container healthy
+  #               and completed; increase the limit and restart to collect more.
+  #
+  # Keep the model class order unchanged when appending to an existing session.
+  # A different class map/camera requires a new session ID to protect existing labels.
+
+  # Example: entrance people, 08:00 through 10:30 UTC.
+  # Replace sessions: [] with the list below and use your actual camera IDs.
+  # sessions:
+  #   - id: entrance-morning
+  #     camera: cam-01
+  #     enabled: true
+  #     schedule:
+  #       after: "08:00"
+  #       before: "10:30"
+  #       start_date: null
+  #       end_date: null
+  #     sampling:
+  #       mode: on_detection
+  #       interval_seconds: null
+  #       frames_per_minute: null
+  #     filters:
+  #       classes: [person]
+  #       min_confidence: 0.75
+  #       min_detections: 1
+  #     save:
+  #       annotated: false
+  #       raw: true
+  #       metadata: false
+  #     max_frames: 500
+  #
+  # Example: random clean frames, including backgrounds, for later annotation.
+  #   - id: parking-general
+  #     camera: cam-02
+  #     enabled: true
+  #     schedule:
+  #       after: null
+  #       before: null
+  #       start_date: null
+  #       end_date: null
+  #     sampling:
+  #       mode: random
+  #       interval_seconds: null
+  #       frames_per_minute: 2
+  #     filters:
+  #       classes: "*"
+  #       min_confidence: 0.60
+  #       min_detections: 0
+  #     save:
+  #       annotated: false
+  #       raw: true
+  #       metadata: false
+  #     max_frames: 0
