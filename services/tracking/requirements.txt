@@ -1,0 +1,4 @@
+boxmot==19.0.0
+numpy>=1.26,<3
+pyzmq>=26,<28
+PyYAML>=6,<7
