@@ -1,0 +1,4 @@
+opencv-python-headless>=4.8,<5
+numpy>=1.26,<3
+pyzmq>=26,<28
+PyYAML>=6,<7
