@@ -10,7 +10,7 @@ notifications:
   # Supported channels:
   #   log       → writes a structured line to the device log (when enabled)
   #   webhooks  → sends an HTTP POST with the alert payload as JSON
-  #   emails    → sends a plain-text alert and its JSON details through SMTP
+  #   emails    → Resend published templates or plain-text SMTP email
   #
   # Webhook payload sent on each alert:
   # {
@@ -117,7 +117,7 @@ notifications:
 
   # ── email channels ──────────────────────────────────────────────────────────
   # Each enabled channel sends one email for each matching alert from rules.
-  # The email contains a readable summary and the full alert JSON.
+  # SMTP email contains a readable summary and alert JSON; Resend uses a template.
   # Delivery is live-only: failures are counted, not retried or persisted.
   # Database notification rows use the separate row builder/buffer/ingest path.
   #
@@ -139,15 +139,16 @@ notifications:
   #                    ssl: TLS from connection start, usually port 465.
   #                    none: unauthenticated local relay, usually port 25.
   #                    Server certificates are verified for starttls/ssl.
-  #   smtp.username    Provider's SMTP login; may differ from from_address.
+  #   smtp.username    Provider's SMTP login; may differ from the sender.
   #   smtp.password_env
   #                    Environment variable NAME containing the SMTP password.
   #                    Required at startup only when this channel is enabled.
   #                    For an unauthenticated relay, set both username and
   #                    password_env to null. Login requires starttls or ssl.
-  #   from_address     Sender address permitted by your SMTP provider.
+  #   from             Sender address, optionally with a display name.
+  #                    Legacy SMTP from_address is still accepted instead.
   #   to               List of 1..50 recipient addresses; no display names.
-  #   subject_prefix   Fixed prefix added to severity, rule and camera name.
+  #   subject_prefix   SMTP only: prefix added to severity, rule and camera name.
   #   timeout_seconds  Total send deadline, from 1 to 300 seconds.
   #   rules            "*" or a list of rule names declared in rules.yaml.
   #   severities       "*" or a list containing info, warning and/or critical.
@@ -169,7 +170,7 @@ notifications:
         username: alerts@example.com
         password_env: VISIONENGINE_SMTP_PASSWORD
 
-      from_address: alerts@example.com
+      from: alerts@example.com
       to:
         - security@example.com
         - supervisor@example.com
@@ -183,3 +184,22 @@ notifications:
     # To limit delivery to specific rules, replace rules: "*" with, for example:
     # rules: [person_restricted_area]
     # The selected rule must exist and have notify: true to produce alerts.
+
+    # Resend API: subject and design come from the published template.
+    # BRANCH_NAME comes from device.yaml location, not this file.
+    - name: resend_email
+      enabled: false
+      provider: resend
+      api_key_env: RESEND_API_KEY
+      template_id: "d0821d80-78ab-4b47-9b1c-22011327459d"
+      from: "Vision Engine <notifications@visionengine.evalholding.com>"
+      to:
+        - recipient@example.com
+      timeout_seconds: 10
+      rules: "*"
+      severities: [warning, critical]
+
+    # Keep RESEND_API_KEY in a private environment variable or ignored .env file.
+    # python -m config.controller --generate
+    # docker compose --env-file .env -f config/.generated/pipeline.compose.yaml up --build -d visionengine-notifier-service
+    # Variable mapping and delivery behavior: services/notifier/README.md.

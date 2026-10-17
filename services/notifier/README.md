@@ -6,7 +6,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.12-142A42?style=flat-square&logo=python)](requirements.txt)
 [![Docker](https://img.shields.io/badge/Docker-notifier-142A42?style=flat-square&logo=docker)](Dockerfile)
-[![Stack](https://img.shields.io/badge/Stack-Webhooks_+_SMTP-142A42?style=flat-square)](#responsibility)
+[![Stack](https://img.shields.io/badge/Stack-Webhooks_+_SMTP_+_Resend-142A42?style=flat-square)](#responsibility)
 
 [Project](../../README.md) · [Services](../README.md) · [Configuration](../../config/README.md) · [Handbook](../../docs/README.md)
 
@@ -18,7 +18,7 @@
 |---|---|
 | Instance scope | One shared instance when enabled |
 | Input | Rules alert.v1 |
-| Output | Webhook / SMTP / log + status |
+| Output | Webhook / SMTP / Resend / log + status |
 | Image | `visionengine-notifier:local` |
 | Generated file | `config/.generated/notifier.compose.yaml` |
 | Entry point | `python -m services.notifier` |
@@ -48,7 +48,7 @@ additional SMTP and bounded/isolated channel workers.
 ## Configuration
 
 `notifications.yaml` owns channels; `api.yaml` and `device.yaml` supply identity
-and API-key auth. Missing `emails` stays compatible; `emails: []` disables SMTP.
+and API-key auth. Missing `emails` stays compatible; `emails: []` disables email.
 Full annotated examples are in
 [notifications.sample.yaml](../../config/config_sample/notifications.sample.yaml).
 
@@ -66,7 +66,7 @@ notifications:
         security: starttls
         username: alerts@example.com
         password_env: VISIONENGINE_SMTP_PASSWORD
-      from_address: alerts@example.com
+      from: alerts@example.com
       to: [security@example.com]
       subject_prefix: "[VisionEngine]"
       timeout_seconds: 10
@@ -92,8 +92,81 @@ $env:VISIONENGINE_SMTP_PASSWORD = "your-provider-password"
 
 Use a private explicit `--env-file .env` if preferred. Do not commit secrets or
 publish interpolated Compose output containing them. Regenerate after changing
-channel enablement/secret variable names. Email is plain text with a summary and
+channel enablement/secret variable names. SMTP email is plain text with a summary and
 alert JSON; safe headers and bounded subject lines avoid newline/header injection.
+
+## Resend published templates
+
+```yaml
+notifications:
+  log:
+    enabled: true
+  webhooks: []  # Keep existing webhook entries if needed.
+  emails:
+    - name: home_lab_email
+      enabled: true
+      provider: resend
+      api_key_env: RESEND_API_KEY
+      template_id: "d0821d80-78ab-4b47-9b1c-22011327459d"
+      from: "Vision Engine <notifications@visionengine.evalholding.com>"
+      to:
+        - osamaandwajeeh@gmail.com
+      timeout_seconds: 10
+      rules: "*"
+      severities: "*"
+```
+
+`from` supports a display name; `to` is a list of plain email addresses.
+SMTP also accepts `from`; legacy SMTP `from_address` remains supported, but
+specifying both is rejected. Omitting `provider` retains SMTP behavior.
+Resend entries reject SMTP-only keys. Disabled channels need valid settings,
+but do not require runtime secrets. No API key is stored in generated YAML.
+
+Put `RESEND_API_KEY=your-send-only-key` in a Git-ignored `.env` at the repository
+root. Run from that root, after publishing the template and verifying its sender:
+
+```console
+python -m config.controller --generate
+docker compose --env-file .env -f config/.generated/pipeline.compose.yaml config --quiet
+docker compose --env-file .env -f config/.generated/pipeline.compose.yaml up --build -d visionengine-notifier-service
+docker compose --env-file .env -f config/.generated/pipeline.compose.yaml logs -f --tail 20 visionengine-notifier-service
+```
+
+The generator passes each enabled channel's named secret. Missing secrets fail
+at Compose evaluation and direct-service startup. Exported environment variables
+also work. Never print interpolated Compose output containing secrets.
+
+| Variable | Source |
+|---|---|
+| `MESSAGE` | Rendered rule alert message |
+| `SEVERITY` | Rule severity |
+| `SEVERITY_COLOR` | info: green `#15803d`; warning: amber `#b54708`; critical: red `#b42318` |
+| `BRANCH_NAME` | `device.yaml` → `device.location` |
+| `CAMERA_NAME` | Alert camera name |
+| `RULE_NAME` | Matched rule name |
+| `ZONE` | Alert zone |
+| `CAPTURED_AT` | Capture timestamp normalized to UTC |
+| `EVENT_REFERENCE` | Rules-generated `alert_id` |
+
+Mapping is explicit, not discovered from the template ID. Template variable names
+must match these keys; the API key needs sending permission only. Resend provides
+the published subject/design, so `subject_prefix` does not apply. Strings over
+the provider's 2,000-character variable limit fail locally. Media is not implemented.
+
+Rules adds `alert_id` per emitted alert; notifier carries it into email template
+variables. The existing backend webhook schema stays unchanged. With older rules images, notifier derives a deterministic reference
+from the batch and alert. Database columns are unchanged: notification rows do
+not automatically store the new ID.
+
+Resend uses HTTPS, certificate verification, a total timeout, no redirects, and
+an idempotency key per alert/channel/template/recipient set. Existing bounded
+workers, rule filters and cooldown behavior remain. No retry is added. HTTP
+429/authentication/template errors are counted as failures. Acceptance by Resend
+is not proof of inbox delivery. Response bodies and keys are not logged. Check
+Resend email activity for delivery, bounce and suppression details.
+
+[Resend sending API](https://resend.com/docs/api-reference/emails/send-email) ·
+[Template variables](https://resend.com/docs/dashboard/templates/template-variables)
 
 ## Payload, queues and success semantics
 
@@ -140,7 +213,7 @@ Install `services/notifier/requirements.txt` and run
 | [__main__.py](__main__.py) | Module entry point |
 | [Dockerfile](Dockerfile) | Image layers, packaged code, entry point and healthcheck |
 | [requirements.txt](requirements.txt) | Runtime dependencies |
-| `messaging/` | Service-local wire contracts, validation and input/output adapters: [alerts.py](messaging/alerts.py), [channels.py](messaging/channels.py), [detections.py](messaging/detections.py), [events.py](messaging/events.py), [publisher.py](messaging/publisher.py) |
+| `messaging/` | Service-local wire contracts, validation and input/output adapters: [alerts.py](messaging/alerts.py), [channels.py](messaging/channels.py), [resend.py](messaging/resend.py), [detections.py](messaging/detections.py), [events.py](messaging/events.py), [publisher.py](messaging/publisher.py) |
 | `processing/` | Domain logic, bounded work queues and worker state: [payload.py](processing/payload.py), [queue.py](processing/queue.py), [worker.py](processing/worker.py) |
 | `runtime/` | Configuration, CLI lifecycle, logging and independent healthcheck: [configuration.py](runtime/configuration.py), [healthcheck.py](runtime/healthcheck.py), [logging.py](runtime/logging.py), [service.py](runtime/service.py) |
 | `tools/` | Diagnostic receivers and inspection utilities: [receiver.py](tools/receiver.py) |

@@ -37,7 +37,9 @@ or GPU. Delivery channels and database row building remain separate.
 | Notifying rule; cooldown active | Yes | No | No new alert row |
 
 Several matches accept the object once; several notifying rules can create several
-alerts. Null `notifications_table` can still permit webhook/email delivery.
+alerts. Each emitted alert has an `alert_id` for notification references. Null
+`notifications_table` can still permit webhook/email delivery. Existing database
+columns are unchanged; the alert ID is not automatically stored in a table.
 
 ## Zones, time and cooldown
 

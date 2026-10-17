@@ -82,7 +82,7 @@ camera URLs, local YAMLs or generated files. Models are supplied separately.
 | [cameras.yaml sample](config_sample/cameras.sample.yaml) | Camera IDs/sources, enabled state, target FPS, model/classes, zones and table routing |
 | [models.yaml sample](config_sample/models.sample.yaml) | Model assets, runtime/device, thresholds, input size and tracking choice |
 | [rules.yaml sample](config_sample/rules.sample.yaml) | Matching, UTC schedules, cooldowns, severity/messages and notification tables |
-| [notifications.yaml sample](config_sample/notifications.sample.yaml) | Log, webhook and SMTP channels with rule/severity filters |
+| [notifications.yaml sample](config_sample/notifications.sample.yaml) | Log, webhook, SMTP and Resend template channels with rule/severity filters |
 | [collection.yaml sample](config_sample/collection.sample.yaml) | Output directory, sessions, UTC schedules, sampling, filters and sample limits |
 | [boxmot_tracker.yaml sample](config_sample/boxmot_tracker.sample.yaml) | Algorithm parameters and optional ReID/backend settings |
 | [graph.yaml sample](config_sample/graph.sample.yaml) | Node templates, typed ports, edges, conditions and queue profiles |
@@ -182,7 +182,7 @@ A blank `collection.yaml` or an empty session list disables collection.
 
 Collector requires `save.raw: true` and `save.annotated: false`; YOLO labels are
 always written. `save.metadata` controls optional JSON sidecars. Frames/results
-must match exactly before storage. Enabled SMTP channels use named password
+must match exactly before storage. Enabled SMTP/Resend channels use named secret
 environment variables; generated Compose includes references, never literal
 password values. The variables must be set when Docker reads the files.
 
