@@ -106,7 +106,7 @@ notifications:
     - name: home_lab_email
       enabled: true
       provider: resend
-      api_key_env: RESEND_API_KEY
+      api_key: "re_REPLACE_WITH_YOUR_SEND_ONLY_KEY"
       template_id: "d0821d80-78ab-4b47-9b1c-22011327459d"
       from: "Vision Engine <notifications@visionengine.evalholding.com>"
       to:
@@ -119,22 +119,24 @@ notifications:
 `from` supports a display name; `to` is a list of plain email addresses.
 SMTP also accepts `from`; legacy SMTP `from_address` remains supported, but
 specifying both is rejected. Omitting `provider` retains SMTP behavior.
-Resend entries reject SMTP-only keys. Disabled channels need valid settings,
-but do not require runtime secrets. No API key is stored in generated YAML.
-
-Put `RESEND_API_KEY=your-send-only-key` in a Git-ignored `.env` at the repository
-root. Run from that root, after publishing the template and verifying its sender:
+Resend entries accept exactly `name`, `enabled`, `provider`, `api_key`,
+`template_id`, `from`, `to`, `timeout_seconds`, `rules`, and `severities`.
+The actual API key is read directly from `notifications.yaml`; `api_key_env`
+is not supported for Resend. No environment variable or `.env` file is needed.
+The installation YAML is already Git-ignored and mounted read-only into the
+notifier. The key is omitted from configuration reprs, generated pipeline/Compose
+content, and application logs. Publish the template and verify its sender first.
 
 ```console
 python -m config.controller --generate
-docker compose --env-file .env -f config/.generated/pipeline.compose.yaml config --quiet
-docker compose --env-file .env -f config/.generated/pipeline.compose.yaml up --build -d visionengine-notifier-service
-docker compose --env-file .env -f config/.generated/pipeline.compose.yaml logs -f --tail 20 visionengine-notifier-service
+docker compose -f config/.generated/pipeline.compose.yaml config --quiet
+docker compose -f config/.generated/pipeline.compose.yaml up --build -d visionengine-notifier-service
+docker compose -f config/.generated/pipeline.compose.yaml logs -f --tail 20 visionengine-notifier-service
 ```
 
-The generator passes each enabled channel's named secret. Missing secrets fail
-at Compose evaluation and direct-service startup. Exported environment variables
-also work. Never print interpolated Compose output containing secrets.
+After changing the key or other YAML settings, restart/recreate the notifier to
+reload the file. Rebuild its image only when the service code changes. Existing
+SMTP channels retain their password environment variable behavior.
 
 | Variable | Source |
 |---|---|

@@ -190,7 +190,7 @@ notifications:
     - name: resend_email
       enabled: false
       provider: resend
-      api_key_env: RESEND_API_KEY
+      api_key: "re_REPLACE_WITH_YOUR_SEND_ONLY_KEY"
       template_id: "d0821d80-78ab-4b47-9b1c-22011327459d"
       from: "Vision Engine <notifications@visionengine.evalholding.com>"
       to:
@@ -199,7 +199,7 @@ notifications:
       rules: "*"
       severities: [warning, critical]
 
-    # Keep RESEND_API_KEY in a private environment variable or ignored .env file.
+    # The notifier reads this key directly from the installation YAML.
     # python -m config.controller --generate
-    # docker compose --env-file .env -f config/.generated/pipeline.compose.yaml up --build -d visionengine-notifier-service
+    # docker compose -f config/.generated/pipeline.compose.yaml up --build -d visionengine-notifier-service
     # Variable mapping and delivery behavior: services/notifier/README.md.

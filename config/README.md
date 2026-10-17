@@ -182,9 +182,9 @@ A blank `collection.yaml` or an empty session list disables collection.
 
 Collector requires `save.raw: true` and `save.annotated: false`; YOLO labels are
 always written. `save.metadata` controls optional JSON sidecars. Frames/results
-must match exactly before storage. Enabled SMTP/Resend channels use named secret
-environment variables; generated Compose includes references, never literal
-password values. The variables must be set when Docker reads the files.
+must match exactly before storage. Resend reads `api_key` directly from the notification YAML; it is not copied
+into generated Compose. SMTP channels use named password environment variables,
+which must be set when Docker reads the generated files.
 
 > [!IMPORTANT]
 > Changing `device.environment` changes the default volume namespace. Existing
