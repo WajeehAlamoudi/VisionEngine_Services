@@ -144,6 +144,7 @@ menu_options() {
         menu_pair 3 'Build images only' 8 'Live service logs'
         menu_pair 4 'Start existing images' 9 'Diagnostics / read-only'
         menu_pair 5 'Stop containers' 10 'Enable Docker at boot'
+        printf '%33s' ''; menu_item 11 'Performance report'
     else
         printf '  %sDEPLOYMENT%s\n\n' "$BOLD" "$RESET"
         menu_item 1 'Validate + generate'
@@ -157,6 +158,7 @@ menu_options() {
         menu_item 8 'Live service logs'
         menu_item 9 'Diagnostics / read-only'
         menu_item 10 'Enable Docker at boot'
+        menu_item 11 'Performance report'
     fi
     printf '\n'
     rule
@@ -180,6 +182,7 @@ help_text() {
   logs         Follow the last 30 lines; Ctrl+C exits the view.
   status       Show selected containers, including stopped containers.
   diagnose     Read-only checks for host, config, deployment and health.
+  report       Read-only container resources, sensors and health snapshot.
   enable-boot  Enable Docker at boot; container restart policies still apply.
   help         Show this guide.
 
@@ -294,6 +297,115 @@ diagnose() {
     (( failures == 0 ))
 }
 
+# Read sensors only. Missing vendor tools/sensors are not a deployment failure.
+report_sensors() (
+    shopt -s nullglob
+    local sensor value label chip count=0 sample result
+    heading 'Temperature / host sensors'
+    for sensor in /sys/class/thermal/thermal_zone*/temp; do
+        value="$(cat -- "$sensor" 2>/dev/null)" || continue
+        [[ "$value" =~ ^-?[0-9]+$ ]] || continue
+        label="$(cat -- "${sensor%/temp}/type" 2>/dev/null)"
+        awk -v label="${label:-${sensor%/temp}}" -v value="$value" \
+            'BEGIN {printf "  %s: %.1f C\n", label, value / 1000}'
+        count=$((count + 1))
+    done
+    (( count > 0 )) || printf '  Temperature sensors unavailable or unreadable.\n'
+    heading 'Power / hardware telemetry'
+    count=0
+    for sensor in /sys/class/hwmon/hwmon*/power*_input /sys/class/hwmon/hwmon*/power*_average; do
+        value="$(cat -- "$sensor" 2>/dev/null)" || continue
+        [[ "$value" =~ ^[0-9]+$ ]] || continue
+        chip="$(cat -- "${sensor%/*}/name" 2>/dev/null)"
+        label="$(cat -- "${sensor%_*}_label" 2>/dev/null)"
+        awk -v label="${chip:-hwmon}/${label:-${sensor##*/}}" -v value="$value" \
+            'BEGIN {printf "  %s: %.3f W\n", label, value / 1000000}'
+        count=$((count + 1))
+    done
+    if (( count == 0 )); then
+        printf '  No readable hwmon power sensors; board watts are not estimated.\n'
+    else
+        printf '  Rail readings may overlap; they are not summed into board power.\n'
+    fi
+    if command -v vcgencmd >/dev/null 2>&1; then
+        printf '  Raspberry Pi throttle flags (current + historical): '
+        vcgencmd get_throttled || warn 'Throttle flags unavailable.'
+    fi
+    if command -v tegrastats >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+        printf '  Jetson sample (native output; power rails use the displayed units):\n'
+        sample="$(timeout 3 tegrastats --interval 1000 2>/dev/null)"; result=$?
+        if [[ -n "$sample" ]] && (( result == 0 || result == 124 )); then
+            printf '%s\n' "$sample"
+        else
+            warn 'Jetson telemetry unavailable with current permissions.'
+        fi
+    elif command -v nvidia-smi >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+        printf '  NVIDIA GPU sample (GPU watts, not total board consumption):\n'
+        timeout 5 nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw \
+            --format=csv || warn 'GPU telemetry unavailable on this driver/device.'
+    fi
+)
+
+performance_report() {
+    heading 'Performance report / read-only snapshot'
+    printf '  Captured: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf '  Scope: %s\n' "${TARGETS[*]:-all configured services}"
+    heading 'Host resources (whole device)'
+    uname -srm
+    command -v uptime >/dev/null 2>&1 && uptime
+    command -v free >/dev/null 2>&1 && free -h
+    df -h "$PROJECT_DIR" || warn 'Filesystem usage unavailable.'
+    heading 'Containers / health'
+    local ids id record name state health restarts oom service configured expected_service
+    local checked=0 attention=0 missing=0 stats_failed=0
+    local running_ids=()
+    local -A observed=()
+    ids="$(compose ps -a -q "${TARGETS[@]}")" || return 1
+    configured="$(compose config --services)" || return 1
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        record="$("${DOCKER[@]}" inspect --format '{{.Name}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}not-configured{{end}}|{{.RestartCount}}|{{.State.OOMKilled}}|{{index .Config.Labels "com.docker.compose.service"}}' "$id")" || return 1
+        IFS='|' read -r name state health restarts oom service <<< "$record"
+        printf '  %s\n    state=%s  health=%s  restarts=%s  OOM=%s\n' "${name#/}" "$state" "$health" "$restarts" "$oom"
+        checked=$((checked + 1))
+        [[ -z "$service" ]] || observed["$service"]=1
+        if [[ "$state" == running ]]; then running_ids+=("$id"); fi
+        if [[ "$state" != running || "$health" != healthy || "$oom" == true ]]; then
+            attention=$((attention + 1))
+        fi
+    done <<< "$ids"
+    if (( ${#TARGETS[@]} > 0 )); then configured="${TARGETS[0]}"; fi
+    while IFS= read -r expected_service; do
+        [[ -n "$expected_service" ]] || continue
+        if [[ -z "${observed[$expected_service]:-}" ]]; then
+            warn "Missing container: $expected_service"
+            missing=$((missing + 1))
+        fi
+    done <<< "$configured"
+    heading 'Container resource sample'
+    if (( ${#running_ids[@]} > 0 )); then
+        "${DOCKER[@]}" stats --no-stream \
+            --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}\t{{.PIDs}}' \
+            "${running_ids[@]}" || stats_failed=1
+        printf '  CPU: 100%% represents one core. Network/block I/O are cumulative counters.\n'
+    else
+        warn 'No running containers to sample.'
+    fi
+    report_sensors
+    heading 'Snapshot assessment'
+    printf '  Containers checked: %s | Need attention: %s | Missing services: %s\n' "$checked" "$attention" "$missing"
+    if (( attention > 0 || missing > 0 || checked == 0 || stats_failed > 0 )); then
+        warn 'ATTENTION: inspect container state, health, OOM or resource-read failures.'
+    else
+        info 'Container health snapshot passed.'
+    fi
+    printf '  Restart counts describe this container lifetime; they are not rates.\n'
+    printf '  FPS, queue drops, delivery and long-run stability are NOT validated by this snapshot.\n'
+    printf '  Use live service logs for pipeline rates; no power-per-container estimate is made.\n'
+    (( attention == 0 && missing == 0 && checked > 0 && stats_failed == 0 ))
+}
+
+
 enable_boot() {
     command -v systemctl >/dev/null 2>&1 || { error 'This host does not use systemctl.'; return 1; }
     local admin=()
@@ -313,7 +425,7 @@ run_action() {
         generate) generate; return ;;
         diagnose) diagnose; return ;;
         enable-boot) enable_boot; return ;;
-        deploy|start|stop|restart|build|logs|status) ;;
+        deploy|start|stop|restart|build|logs|status|report) ;;
         *) error "Unknown command: $action"; help_text; return 2 ;;
     esac
     if [[ "$action" == deploy ]]; then generate || return 1; fi
@@ -345,6 +457,7 @@ run_action() {
             printf '  Ctrl+C exits logs; containers keep running.\n'
             compose logs -f --tail 30 "${TARGETS[@]}" ;;
         status) compose ps -a "${TARGETS[@]}" ;;
+        report) performance_report ;;
     esac
 }
 
@@ -375,17 +488,17 @@ menu() {
     while true; do
         banner
         menu_options
-        read -r -p '  Select action [0-10]: ' choice || break
+        read -r -p '  Select action [0-11]: ' choice || break
         case "$choice" in
             0) break ;;
             1) action=generate ;; 2) action=deploy ;; 3) action=build ;;
             4) action=start ;; 5) action=stop ;; 6) action=restart ;;
             7) action=status ;; 8) action=logs ;; 9) action=diagnose ;;
-            10) action=enable-boot ;; *) warn 'Choose a listed number.'; continue ;;
+            10) action=enable-boot ;; 11) action=report ;; *) warn 'Choose a listed number.'; continue ;;
         esac
         CHOSEN=all
         case "$action" in
-            deploy|build|start|stop|restart|status|logs) pick_service || continue ;;
+            deploy|build|start|stop|restart|status|logs|report) pick_service || continue ;;
         esac
         run_action "$action" "$CHOSEN"; rc=$?
         if (( rc != 0 && rc != 130 )); then error "Action needs attention (exit $rc). See the output above."; fi
