@@ -108,6 +108,19 @@ send real webhooks and email. Review your installation values before starting.
 docker compose -f config/.generated/pipeline.compose.yaml stop
 ```
 
+## Linux operator menu
+
+Use the menu to generate configuration, build/deploy all or one service, view
+logs/status, diagnose the device and enable Docker at boot:
+
+```bash
+bash scripts/service.sh
+```
+
+Direct commands include `bash scripts/service.sh deploy` and
+`bash scripts/service.sh diagnose`. Deployment recreates selected containers;
+persistent data is preserved. [Commands and behavior](docs/OPERATOR.md)
+
 ## Navigate the project
 
 | Location | What belongs here |
