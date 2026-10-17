@@ -12,7 +12,10 @@ The menu groups configuration, image builds, container controls, live logs,
 read-only diagnostics and Docker boot setup. It lists the actual service names
 from generated Compose so you can choose all services or a single instance.
 Colored headings appear on terminals; `NO_COLOR=1` disables them. Docker keeps
-its native live build progress. Errors remain visible and return you to the menu.
+its native live build progress. Quiet dependency and Compose validation checks show
+a loading spinner on interactive terminals; success/failure replaces that spinner.
+Set `VISIONENGINE_NO_ANIMATION=1` to disable animation. Non-interactive output is
+plain. Errors remain visible and return you to the menu.
 
 ## Direct commands
 
