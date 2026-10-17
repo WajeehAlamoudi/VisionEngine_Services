@@ -1100,16 +1100,19 @@ def _notifier(node, config, project, destination, directory, pipeline, outputs):
         command += ["--" + key.replace("_", "-"), str(policy[key] or 0)]
     environment = _logging_environment(config)
     for email in config["notifications"].emails:
-        if email.enabled and email.smtp.password_env:
-            variable = email.smtp.password_env
-            if variable in environment or variable == "NOTIFIER_HEALTH_FILE":
+        if email.enabled and email.secret_env:
+            variable = email.secret_env
+            reference = "${" + variable + ":?Set " + variable + " for notifier}"
+            if (
+                variable in environment and environment[variable] != reference
+            ) or variable == "NOTIFIER_HEALTH_FILE":
                 raise ConfigError(
                     "deployment",
-                    ["SMTP password environment name conflicts with service settings"],
+                    [
+                        "Notification secret environment name conflicts with service settings"
+                    ],
                 )
-            environment[variable] = (
-                "${" + variable + ":?Set " + variable + " for notifier}"
-            )
+            environment[variable] = reference
     service = {
         "image": "visionengine-notifier:local",
         "build": {

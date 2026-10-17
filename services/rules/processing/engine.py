@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 import time
+from uuid import uuid4
 
 from .zones import assign_zone
 
@@ -57,6 +58,7 @@ class RulesEngine:
             self.last_fired[key] = now
             matches.append(
                 {
+                    "alert_id": str(uuid4()),
                     "rule_name": rule.name,
                     "severity": rule.severity,
                     "message": format_message(rule.message, event),

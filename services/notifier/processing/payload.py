@@ -1,9 +1,24 @@
 """Match the original Edge webhook fields; no dependency on parent engine code."""
 
+import json
+from uuid import UUID, uuid5, NAMESPACE_URL
 
-def build_payload(alert, device_id, branch_id):
+
+def build_payload(alert, device_id, branch_id, *, source=None):
     det = alert["detection"]
+    # Older rules images get a deterministic reference from the batch identity.
+    try:
+        reference = str(UUID(alert["alert_id"]))
+    except (KeyError, ValueError, TypeError, AttributeError):
+        identity = [branch_id, device_id, source, alert]
+        reference = str(
+            uuid5(
+                NAMESPACE_URL,
+                json.dumps(identity, sort_keys=True, separators=(",", ":")),
+            )
+        )
     return {
+        "alert_id": reference,
         "branch_id": branch_id,
         "device_id": device_id,
         "rule_name": alert["rule_name"],

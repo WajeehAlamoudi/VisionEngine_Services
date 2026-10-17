@@ -3,7 +3,7 @@
 import asyncio
 from dataclasses import dataclass
 from email.message import EmailMessage
-from email.utils import formatdate, make_msgid
+from email.utils import formatdate, make_msgid, parseaddr
 import json
 import time
 
@@ -32,7 +32,8 @@ class Webhook:
                 async with self.client.stream(
                     "POST",
                     self.config.url,
-                    json=payload,
+                    # Keep the existing backend webhook schema unchanged.
+                    json={k: v for k, v in payload.items() if k != "alert_id"},
                     headers={"X-API-Key": self.api_key}
                     if self.config.auth == "api_key"
                     else {},
@@ -92,7 +93,7 @@ class Email:
                 await client.connect()
                 refused, _ = await client.send_message(
                     email_message(cfg, payload),
-                    sender=cfg.from_address,
+                    sender=parseaddr(cfg.from_address)[1],
                     recipients=cfg.to,
                 )
                 accepted = Result(

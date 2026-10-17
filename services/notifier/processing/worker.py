@@ -8,6 +8,7 @@ import logging
 from .queue import Inbox
 from .payload import build_payload
 from ..messaging.channels import Webhook, Email
+from ..messaging.resend import Resend
 
 log = logging.getLogger("notifier")
 
@@ -33,12 +34,18 @@ class Dispatcher:
         ):
             for cfg in configs:
                 if cfg.enabled:
+                    if kind == "webhook":
+                        sender = Webhook(cfg, api.key, client)
+                    elif cfg.provider == "resend":
+                        sender = Resend(
+                            cfg, passwords.get(cfg.name), client, device.location
+                        )
+                    else:
+                        sender = Email(cfg, passwords.get(cfg.name))
                     self.channels[cfg.name] = {
                         "kind": kind,
                         "config": cfg,
-                        "sender": Webhook(cfg, api.key, client)
-                        if kind == "webhook"
-                        else Email(cfg, passwords.get(cfg.name)),
+                        "sender": sender,
                         "inbox": Inbox(max_items, max_bytes, max_age_ms),
                         "sent_total": 0,
                         "failed_total": 0,
@@ -64,7 +71,7 @@ class Dispatcher:
         if len(self.seen) > 4096:
             self.seen.popitem(last=False)
         self.processed += 1
-        for alert in batch["alerts"]:
+        for alert_index, alert in enumerate(batch["alerts"]):
             self.alerts_total += 1
             if self.settings.log.enabled:
                 det = alert["detection"]
@@ -85,7 +92,12 @@ class Dispatcher:
                     },
                 )
                 self.logged_total += 1
-            payload = build_payload(alert, self.device.id, self.api.branch_id)
+            payload = build_payload(
+                alert,
+                self.device.id,
+                self.api.branch_id,
+                source=(batch["stream_id"], batch["sequence"], alert_index),
+            )
             size = len(
                 json.dumps(payload, separators=(",", ":"), allow_nan=False).encode()
             )

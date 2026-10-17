@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from email.headerregistry import Address
+from email.headerregistry import Address, HeaderRegistry
 from email.errors import HeaderParseError
 import re
 from typing import Any
@@ -63,13 +63,21 @@ class SmtpConfig:
 class EmailConfig:
     name: str
     enabled: bool
-    smtp: SmtpConfig
+    smtp: SmtpConfig | None
     from_address: str
     to: list[str]
     subject_prefix: str
     timeout_seconds: int
     rules: list[str]
     severities: list[str]
+
+    provider: str = "smtp"
+    api_key_env: str | None = None
+    template_id: str | None = None
+
+    @property
+    def secret_env(self) -> str | None:
+        return self.api_key_env if self.provider == "resend" else self.smtp.password_env
 
     def accepts(self, rule_name: str, severity: str) -> bool:
         return (not self.rules or rule_name in self.rules) and (
@@ -140,22 +148,7 @@ def _mailbox(r, key):
     return value
 
 
-def _parse_email(r):
-    r.reject_unknown(
-        "name",
-        "enabled",
-        "smtp",
-        "from_address",
-        "to",
-        "subject_prefix",
-        "timeout_seconds",
-        "rules",
-        "severities",
-    )
-    name = r.identifier(
-        "name", ID_PATTERN, "letters, digits, hyphens, underscores only"
-    )
-    enabled = r.boolean("enabled")
+def _parse_smtp(r):
     smtp = r.section("smtp")
     smtp.reject_unknown("host", "port", "security", "username", "password_env")
     host = smtp.string("host")
@@ -187,7 +180,70 @@ def _parse_email(r):
         )
     if username and any(c in username for c in "\r\n"):
         smtp.error(smtp.path_of("username"), "newlines are not allowed")
-    sender = _mailbox(r, "from_address")
+    return SmtpConfig(host, port, security, username, password_env)
+
+
+def _sender(r):
+    if r.has("from") and r.has("from_address"):
+        r.error(r.path_of("from"), "use from, not both from and from_address")
+    if not r.has("from"):
+        return _mailbox(r, "from_address")  # Legacy SMTP configuration.
+    value = r.string("from")
+    try:
+        if any(c in value for c in "\r\n"):
+            raise ValueError("newline")
+        header = HeaderRegistry()("From", value)
+        if header.defects or len(header.addresses) != 1:
+            raise ValueError("invalid sender")
+        address = header.addresses[0]
+        address.addr_spec.encode("ascii")
+        if not address.username or not address.domain:
+            raise ValueError("invalid sender")
+    except (ValueError, TypeError, UnicodeError, HeaderParseError, IndexError):
+        r.error(
+            r.path_of("from"),
+            "expected one email address, optionally with a display name",
+        )
+    return value
+
+
+def _parse_email(r):
+    provider = r.raw.get("provider", "smtp")
+    if provider not in ("smtp", "resend"):
+        r.error(r.path_of("provider"), "expected smtp or resend")
+        provider = "smtp"
+    common = (
+        "name",
+        "enabled",
+        "provider",
+        "from",
+        "to",
+        "timeout_seconds",
+        "rules",
+        "severities",
+    )
+    if provider == "resend":
+        r.reject_unknown(*common, "api_key_env", "template_id")
+    else:
+        r.reject_unknown(*common, "from_address", "smtp", "subject_prefix")
+    name = r.identifier(
+        "name", ID_PATTERN, "letters, digits, hyphens, underscores only"
+    )
+    enabled = r.boolean("enabled")
+    smtp = _parse_smtp(r) if provider == "smtp" else None
+    api_key_env = template_id = None
+    if provider == "resend":
+        api_key_env = r.string("api_key_env")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", api_key_env):
+            r.error(r.path_of("api_key_env"), "expected an environment variable name")
+        template_id = r.string("template_id")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", template_id):
+            r.error(
+                r.path_of("template_id"), "expected a published template ID or alias"
+            )
+        if not r.has("from"):
+            r.error(r.path_of("from"), "required for Resend")
+    sender = _sender(r)
     recipients = r.raw.get("to")
     if not isinstance(recipients, list) or not 1 <= len(recipients) <= 50:
         r.error(r.path_of("to"), "expected 1..50 recipient email addresses")
@@ -200,7 +256,7 @@ def _parse_email(r):
         if recipient in to:
             r.error(r.path_of("to"), "duplicate recipient")
         to.append(recipient)
-    prefix = r.string("subject_prefix")
+    prefix = r.string("subject_prefix") if provider == "smtp" else ""
     if len(prefix) > 120 or any(c in prefix for c in "\r\n"):
         r.error(
             r.path_of("subject_prefix"),
@@ -214,13 +270,16 @@ def _parse_email(r):
     return EmailConfig(
         name,
         enabled,
-        SmtpConfig(host, port, security, username, password_env),
+        smtp,
         sender,
         to,
         prefix,
         timeout,
         [] if rules == ALL else list(rules),
         [] if severities == ALL else list(severities),
+        provider,
+        api_key_env,
+        template_id,
     )
 
 

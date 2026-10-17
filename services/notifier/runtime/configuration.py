@@ -1,4 +1,4 @@
-"""Read installation configuration; resolve SMTP secrets only at service startup."""
+"""Read installation configuration; resolve channel secrets only at service startup."""
 
 import os
 import logging
@@ -14,20 +14,20 @@ def load_settings(directory):
     )
     passwords = {}
     for channel in settings.emails:
-        if channel.enabled and channel.smtp.password_env:
-            value = os.environ.get(channel.smtp.password_env)
+        if channel.enabled and channel.secret_env:
+            value = os.environ.get(channel.secret_env)
             if not value:
                 logging.getLogger("notifier").error(
-                    "SMTP password environment variable is missing",
+                    "Notification secret environment variable is missing",
                     extra={
                         "fields": {
                             "channel": channel.name,
-                            "variable": channel.smtp.password_env,
+                            "variable": channel.secret_env,
                         }
                     },
                 )
                 raise ValueError(
-                    "missing SMTP password environment variable for channel "
+                    "missing Notification secret environment variable for channel "
                     + channel.name
                 )
             passwords[channel.name] = value
