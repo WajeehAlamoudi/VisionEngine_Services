@@ -8,22 +8,160 @@ cd -- "$PROJECT_DIR" || exit 1
 DOCKER=()
 PYTHON=""
 TARGETS=()
-CYAN='' GREEN='' YELLOW='' RED='' BOLD='' RESET=''
+CYAN='' GREEN='' YELLOW='' RED='' BOLD='' DIM='' RESET=''
 if [[ -t 1 && -z "${NO_COLOR+x}" && "${TERM:-dumb}" != dumb ]]; then
     CYAN=$'\033[36m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
-    RED=$'\033[31m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+    RED=$'\033[31m'; BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
 fi
 info() { printf '%s  + %s%s\n' "$GREEN" "$*" "$RESET"; }
 warn() { printf '%s  ! %s%s\n' "$YELLOW" "$*" "$RESET"; }
 error() { printf '%s  x %s%s\n' "$RED" "$*" "$RESET" >&2; }
 heading() { printf '\n%s%s  %s%s\n' "$BOLD" "$CYAN" "$*" "$RESET"; }
 
+# Animate only quiet checks. Builds, logs, and password prompts stay visible.
+# The spinner runs separately; the actual command retains its normal exit code.
+run_quiet() (
+    local label="$1"; shift
+    if [[ ! -t 1 || "${TERM:-dumb}" == dumb || "${VISIONENGINE_NO_ANIMATION:-0}" == 1 ]]; then
+        "$@"
+        exit $?
+    fi
+    local output spinner_pid='' result
+    output="$(mktemp)" || exit 1
+    cleanup_spinner() {
+        if [[ -n "$spinner_pid" ]]; then
+            kill "$spinner_pid" 2>/dev/null || true
+            wait "$spinner_pid" 2>/dev/null || true
+        fi
+        rm -f -- "$output"
+    }
+    trap cleanup_spinner EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    (
+        local frame
+        while true; do
+            for frame in '|' '/' '-' '\'; do
+                printf '\r  %s[%s]%s %s...' "$CYAN" "$frame" "$RESET" "$label"
+                sleep 0.12
+            done
+        done
+    ) &
+    spinner_pid=$!
+    "$@" >"$output" 2>&1
+    result=$?
+    kill "$spinner_pid" 2>/dev/null || true
+    wait "$spinner_pid" 2>/dev/null || true
+    spinner_pid=''
+    printf '\r\033[2K'
+    if (( result == 0 )); then
+        info "$label"
+    else
+        error "$label failed (exit $result)."
+        cat -- "$output"
+    fi
+    exit "$result"
+)
+
+# Keep terminal layout separate from deployment behavior. Widths apply to plain
+# labels only; ANSI color escapes are printed outside padded fields.
+layout_width() {
+    local columns="${COLUMNS:-}"
+    if [[ ! "$columns" =~ ^[0-9]+$ ]]; then
+        columns="$(tput cols 2>/dev/null || printf '80')"
+    fi
+    [[ "$columns" =~ ^[0-9]+$ ]] || columns=80
+    UI_WIDTH=$((10#$columns))
+    (( UI_WIDTH <= 100 )) || UI_WIDTH=100
+    (( UI_WIDTH >= 36 )) || UI_WIDTH=36
+}
+
+rule() {
+    local line
+    printf -v line '%*s' "$((UI_WIDTH - 4))" ''
+    printf '  %s%s%s\n' "$DIM" "${line// /─}" "$RESET"
+}
+
+context_line() {
+    local label="$1" value="$2" available=$((UI_WIDTH - 16))
+    if (( ${#value} > available )); then value="...${value: -$((available - 3))}"; fi
+    printf '  %s%-9s%s %s\n' "$DIM" "$label" "$RESET" "$value"
+}
+
 banner() {
-    heading 'VISION ENGINE / SERVICES'
-    printf '  Configuration  >  Pipeline  >  Containers  >  Health\n'
-    printf '  ----------------------------------------------------\n'
-    printf '  Project: %s\n' "$PROJECT_DIR"
-    printf '  Compose: config/.generated/pipeline.compose.yaml\n'
+    layout_width
+    printf '\n%s%s' "$BOLD" "$CYAN"
+    if (( UI_WIDTH >= 100 )); then
+        cat <<'BRAND'
+  ██╗   ██╗██╗███████╗██╗ ██████╗ ███╗   ██╗    ███████╗███╗   ██╗ ██████╗ ██╗███╗   ██╗███████╗
+  ██║   ██║██║██╔════╝██║██╔═══██╗████╗  ██║    ██╔════╝████╗  ██║██╔════╝ ██║████╗  ██║██╔════╝
+  ██║   ██║██║███████╗██║██║   ██║██╔██╗ ██║    █████╗  ██╔██╗ ██║██║  ███╗██║██╔██╗ ██║█████╗
+  ╚██╗ ██╔╝██║╚════██║██║██║   ██║██║╚██╗██║    ██╔══╝  ██║╚██╗██║██║   ██║██║██║╚██╗██║██╔══╝
+   ╚████╔╝ ██║███████║██║╚██████╔╝██║ ╚████║    ███████╗██║ ╚████║╚██████╔╝██║██║ ╚████║███████╗
+    ╚═══╝  ╚═╝╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝    ╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝  ╚═══╝╚══════╝
+BRAND
+    elif (( UI_WIDTH >= 62 )); then
+        cat <<'BRAND'
+  ██╗   ██╗██╗███████╗██╗ ██████╗ ███╗   ██╗
+  ██║   ██║██║██╔════╝██║██╔═══██╗████╗  ██║
+  ██║   ██║██║███████╗██║██║   ██║██╔██╗ ██║
+  ╚██╗ ██╔╝██║╚════██║██║██║   ██║██║╚██╗██║
+   ╚████╔╝ ██║███████║██║╚██████╔╝██║ ╚████║
+    ╚═══╝  ╚═╝╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝
+  E N G I N E   /   S E R V I C E S
+BRAND
+    else
+        printf '  V I S I O N   E N G I N E\n  S E R V I C E S\n'
+    fi
+    printf '%s\n' "$RESET"
+    if (( UI_WIDTH >= 62 )); then
+        printf '  %s SERVICES %s  /  DOCKER COMPOSE  /  EDGE OPERATIONS\n' "$BOLD" "$RESET"
+        printf '  %sConfigure. Deploy. Observe.%s\n' "$DIM" "$RESET"
+    else
+        printf '  %sEDGE OPERATIONS / DOCKER COMPOSE%s\n' "$DIM" "$RESET"
+    fi
+    rule
+    context_line 'PROJECT' "$PROJECT_DIR"
+    context_line 'COMPOSE' 'config/.generated/pipeline.compose.yaml'
+    rule
+}
+
+menu_pair() {
+    printf '  %s[%2s]%s %-26s  %s[%2s]%s %s\n' \
+        "$CYAN" "$1" "$RESET" "$2" "$CYAN" "$3" "$RESET" "$4"
+}
+
+menu_item() {
+    printf '  %s[%2s]%s %s\n' "$CYAN" "$1" "$RESET" "$2"
+}
+
+menu_options() {
+    printf '\n'
+    if (( UI_WIDTH >= 82 )); then
+        printf '       %s%-35s%s%s\n\n' "$BOLD" 'DEPLOYMENT' 'OPERATIONS' "$RESET"
+        menu_pair 1 'Validate + generate' 6 'Restart containers'
+        menu_pair 2 'Build + deploy' 7 'Container status'
+        menu_pair 3 'Build images only' 8 'Live service logs'
+        menu_pair 4 'Start existing images' 9 'Diagnostics / read-only'
+        menu_pair 5 'Stop containers' 10 'Enable Docker at boot'
+    else
+        printf '  %sDEPLOYMENT%s\n\n' "$BOLD" "$RESET"
+        menu_item 1 'Validate + generate'
+        menu_item 2 'Build + deploy'
+        menu_item 3 'Build images only'
+        menu_item 4 'Start existing images'
+        menu_item 5 'Stop containers'
+        printf '\n  %sOPERATIONS%s\n\n' "$BOLD" "$RESET"
+        menu_item 6 'Restart containers'
+        menu_item 7 'Container status'
+        menu_item 8 'Live service logs'
+        menu_item 9 'Diagnostics / read-only'
+        menu_item 10 'Enable Docker at boot'
+    fi
+    printf '\n'
+    rule
+    menu_item 0 'Exit'
+    printf '\n'
 }
 
 help_text() {
@@ -61,7 +199,7 @@ find_python() {
     else
         error 'Python 3 is missing. Install the controller prerequisites first.'; return 1
     fi
-    if ! "$PYTHON" -c 'import yaml' >/dev/null 2>&1; then
+    if ! run_quiet 'Checking Python dependencies' "$PYTHON" -c 'import yaml'; then
         error "PyYAML is missing for $PYTHON. Install config/controller/requirements.txt."; return 1
     fi
 }
@@ -84,7 +222,7 @@ require_docker() {
 compose() { "${DOCKER[@]}" compose -f "$COMPOSE_FILE" "$@"; }
 validate_compose() {
     [[ -f "$COMPOSE_FILE" ]] || { error 'Compose is missing. Run generate first.'; return 1; }
-    compose config --quiet
+    run_quiet 'Validating generated Compose' compose config --quiet
 }
 select_target() {
     TARGETS=()
@@ -218,9 +356,9 @@ pick_service() {
     services="$(compose config --services)" || return 1
     local choices=(all)
     while IFS= read -r line; do [[ -z "$line" ]] || choices+=("$line"); done <<< "$services"
-    printf '\n  0) All configured services\n'
+    heading 'SELECT SERVICE'; rule; menu_item 0 'All configured services'
     local i
-    for ((i=1; i<${#choices[@]}; i++)); do printf '  %s) %s\n' "$i" "${choices[$i]}"; done
+    for ((i=1; i<${#choices[@]}; i++)); do menu_item "$i" "${choices[$i]}"; done
     read -r -p '  Scope [0]: ' answer || return 1
     answer="${answer:-0}"
     for ((i=0; i<${#choices[@]}; i++)); do
@@ -236,16 +374,8 @@ menu() {
     trap 'printf "\n"' INT
     while true; do
         banner
-        cat <<'MENU'
-
-   1  Validate + generate       6  Restart containers
-   2  Build + deploy           7  Status
-   3  Build images only        8  Live logs
-   4  Start existing images    9  Diagnostics (read-only)
-   5  Stop containers         10  Enable Docker at boot
-                              0  Exit
-MENU
-        read -r -p '  Select: ' choice || break
+        menu_options
+        read -r -p '  Select action [0-10]: ' choice || break
         case "$choice" in
             0) break ;;
             1) action=generate ;; 2) action=deploy ;; 3) action=build ;;
