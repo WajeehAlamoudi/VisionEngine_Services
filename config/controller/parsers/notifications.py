@@ -72,12 +72,12 @@ class EmailConfig:
     severities: list[str]
 
     provider: str = "smtp"
-    api_key_env: str | None = None
+    api_key: str | None = field(default=None, repr=False)
     template_id: str | None = None
 
     @property
     def secret_env(self) -> str | None:
-        return self.api_key_env if self.provider == "resend" else self.smtp.password_env
+        return None if self.provider == "resend" else self.smtp.password_env
 
     def accepts(self, rule_name: str, severity: str) -> bool:
         return (not self.rules or rule_name in self.rules) and (
@@ -223,7 +223,7 @@ def _parse_email(r):
         "severities",
     )
     if provider == "resend":
-        r.reject_unknown(*common, "api_key_env", "template_id")
+        r.reject_unknown(*common, "api_key", "template_id")
     else:
         r.reject_unknown(*common, "from_address", "smtp", "subject_prefix")
     name = r.identifier(
@@ -231,11 +231,13 @@ def _parse_email(r):
     )
     enabled = r.boolean("enabled")
     smtp = _parse_smtp(r) if provider == "smtp" else None
-    api_key_env = template_id = None
+    api_key = template_id = None
     if provider == "resend":
-        api_key_env = r.string("api_key_env")
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", api_key_env):
-            r.error(r.path_of("api_key_env"), "expected an environment variable name")
+        api_key = r.string("api_key")
+        if not re.fullmatch(r"re_[A-Za-z0-9_-]+", api_key):
+            r.error(
+                r.path_of("api_key"), "expected a Resend API key beginning with re_"
+            )
         template_id = r.string("template_id")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", template_id):
             r.error(
@@ -278,7 +280,7 @@ def _parse_email(r):
         [] if rules == ALL else list(rules),
         [] if severities == ALL else list(severities),
         provider,
-        api_key_env,
+        api_key,
         template_id,
     )
 

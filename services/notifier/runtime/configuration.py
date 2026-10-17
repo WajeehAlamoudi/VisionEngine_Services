@@ -14,7 +14,9 @@ def load_settings(directory):
     )
     passwords = {}
     for channel in settings.emails:
-        if channel.enabled and channel.secret_env:
+        if channel.enabled and channel.provider == "resend":
+            passwords[channel.name] = channel.api_key
+        elif channel.enabled and channel.secret_env:
             value = os.environ.get(channel.secret_env)
             if not value:
                 logging.getLogger("notifier").error(
