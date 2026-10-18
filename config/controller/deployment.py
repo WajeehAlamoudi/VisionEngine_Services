@@ -1648,6 +1648,11 @@ def compile_deployment(
     if monitor_nodes:
         stage.append("monitor")
         _monitor_watches(config, pipeline, services, monitor_name)
+    for service in services.values():
+        service["logging"] = {
+            "driver": "json-file",
+            "options": {"max-size": "10m", "max-file": "3"},
+        }
     compose = {
         "name": f"visionengine-{config['device'].environment}-edge",
         "x-visionengine": {
@@ -1703,6 +1708,7 @@ def dump_compose(document) -> str:
         "init": "Process lifecycle and restart behavior.",
         "command": "Arguments appended to the image ENTRYPOINT.",
         "environment": "Console/JSON logs, severity threshold and terminal colors; override with host environment variables.",
+        "logging": "Rotate Docker terminal logs: 10 MiB per file, three files per container.",
         "ports": "Host address:host port:container port; host access is local by default.",
         "volumes": "Configuration, assets and persistent data mounts.",
         "depends_on": "Start upstream containers first; inputs reconnect independently.",
