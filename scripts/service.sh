@@ -222,7 +222,15 @@ require_docker() {
     fi
     "${DOCKER[@]}" compose version || return 1
 }
-compose() { "${DOCKER[@]}" compose -f "$COMPOSE_FILE" "$@"; }
+compose() {
+    local -a files=(-f "$COMPOSE_FILE")
+
+    if [[ -f "$PROJECT_DIR/config/deployment.compose.yaml" ]]; then
+        files+=(-f "$PROJECT_DIR/config/deployment.compose.yaml")
+    fi
+
+    "${DOCKER[@]}" compose "${files[@]}" "$@"
+}
 validate_compose() {
     [[ -f "$COMPOSE_FILE" ]] || { error 'Compose is missing. Run generate first.'; return 1; }
     run_quiet 'Validating generated Compose' compose config --quiet
