@@ -15,6 +15,7 @@
 | Learn the complete configuration → generation → run workflow | [Usage walkthrough](USAGE.md) |
 | Understand service boundaries and frame flow | [Architecture](ARCHITECTURE.md) |
 | Bring a new device online | [Deployment](DEPLOYMENT.md) |
+| Select a GPU image and preserve per-device hardware settings | [GPU deployment](GPU_DEPLOYMENT.md) |
 | Use the Linux menu for deploy, logs and diagnostics | [Operator menu](OPERATOR.md) |
 | Understand project, image, service and container names | [Naming](NAMING.md) |
 | Update one service without rebuilding the entire deployment | [Updates](UPDATES.md) |

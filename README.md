@@ -62,7 +62,8 @@ at least once. [Read the delivery boundaries](docs/ARCHITECTURE.md#delivery-boun
 `include` support (v2.20.0 or newer). Run commands from this repository's root.
 Container architecture, drivers and model runtimes must match the target device.
 The reference inference/tracking images use CPU Torch; Jetson acceleration needs
-a compatible image and GPU runtime.
+a compatible image and GPU runtime. Follow the [GPU deployment guide](docs/GPU_DEPLOYMENT.md)
+to discover compatible images, verify the model and configure persistent device overrides.
 
 ### 1 · Prepare configuration
 

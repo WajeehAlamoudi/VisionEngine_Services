@@ -74,6 +74,10 @@ bash scripts/service.sh enable-boot
 
 Use your generated service names. All operations use this repository's
 `config/.generated/pipeline.compose.yaml`, regardless of the calling directory.
+When `config/deployment.compose.yaml` exists, the Compose helper automatically
+loads it after the generated pipeline for build/start/stop/status/log operations.
+Generation leaves this local override intact. Direct Docker commands require
+both files explicitly; see [GPU deployment](GPU_DEPLOYMENT.md).
 Docker access uses your current account if possible, otherwise `sudo docker`.
 Run the script as your normal user so generation uses your local Python setup
 and files retain the correct ownership. Python is selected from `.venv/bin/python`

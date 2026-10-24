@@ -19,6 +19,11 @@ runtime still matter. Reference inference/tracking images use CPU Torch. Jetson
 requires a compatible JetPack/vendor image and GPU access; native Apple backends
 are not provided inside Linux Docker containers.
 
+For GPU image selection, model compatibility checks and the persistent
+`config/deployment.compose.yaml` override, follow the [GPU deployment guide](GPU_DEPLOYMENT.md).
+When an override is present, use the operator script or supply both Compose files
+to direct commands below; the generated file alone does not apply local GPU settings.
+
 ## 2 · Clone and configure
 
 ```console

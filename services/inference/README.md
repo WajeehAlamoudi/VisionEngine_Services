@@ -12,6 +12,9 @@
 
 </div>
 
+For GPU base images, NVIDIA access, per-model Compose overrides and operational
+checks, follow the [GPU deployment guide](../../docs/GPU_DEPLOYMENT.md).
+
 ## Responsibility
 
 | Property | Value |
