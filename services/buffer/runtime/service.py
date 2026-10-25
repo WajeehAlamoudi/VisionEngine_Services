@@ -33,6 +33,7 @@ def dispatch(database, request):
     fields = {
         "put": {"batch_id", "batch"},
         "claim": {"limit", "lease_seconds", "max_bytes"},
+        "claim_delivery": {"limit", "lease_seconds", "max_bytes"},
         "peek": {"limit", "max_bytes"},
         "ack": {"lease_id", "ids"},
         "release": {"lease_id"},

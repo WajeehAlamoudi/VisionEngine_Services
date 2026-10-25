@@ -28,8 +28,21 @@ CREATE TABLE IF NOT EXISTS leases (
     token TEXT PRIMARY KEY, state TEXT NOT NULL, expires_at REAL NOT NULL,
     ids TEXT NOT NULL, acked TEXT NOT NULL, created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS deliveries (
+    delivery_id TEXT PRIMARY KEY, table_name TEXT NOT NULL, row_ids TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending','completed')),
+    created_at REAL NOT NULL, completed_at REAL
+);
+CREATE INDEX IF NOT EXISTS deliveries_state ON deliveries(state,created_at);
 CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 """
+
+
+# Pending deliveries own their rows even between leases and across restarts.
+UNASSIGNED = """NOT EXISTS (
+    SELECT 1 FROM deliveries AS d, json_each(d.row_ids) AS member
+    WHERE d.state='pending' AND member.value=rows.id
+)"""
 
 
 def integer(value, name, minimum=1, maximum=1000):
@@ -52,7 +65,7 @@ class Database:
             legacy = self.connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE name='buffer'"
             ).fetchone()
-            if version not in (0, 1) or legacy:
+            if version not in (0, 1, 2) or legacy:
                 raise ValueError(
                     "unsupported or legacy buffer database; explicit migration is required"
                 )
@@ -60,9 +73,10 @@ class Database:
             self.connection.execute("PRAGMA journal_mode=WAL")
             self.connection.execute("PRAGMA synchronous=FULL")
             self.connection.execute("PRAGMA busy_timeout=10000")
-            self.connection.executescript(SCHEMA)
-            self.connection.execute("PRAGMA user_version=1")
-            self.connection.commit()
+            # Additive, transactional migration; existing rows and leases survive.
+            self.connection.executescript(
+                "BEGIN IMMEDIATE;\n" + SCHEMA + "\nPRAGMA user_version=2;\nCOMMIT;"
+            )
             self.maintain()
         except Exception:
             self.connection.close()
@@ -122,7 +136,8 @@ class Database:
                 - self.connection.execute("PRAGMA freelist_count").fetchone()[0]
             )
             evictable = self.connection.execute(
-                "SELECT 1 FROM rows WHERE status IN ('pending','sent') LIMIT 1"
+                "SELECT 1 FROM rows WHERE status='sent' OR "
+                f"(status='pending' AND {UNASSIGNED}) LIMIT 1"
             ).fetchone()
             if live_pages * page_size >= self.max_bytes and not evictable:
                 raise BufferError(
@@ -153,13 +168,21 @@ class Database:
         self.maintain()
         return {"batch_id": batch_id, "stored": len(batch["rows"]), "duplicate": False}
 
-    def _select(self, limit, max_bytes):
+    def _select(self, limit, max_bytes, *, table_name=None, unassigned=True):
         integer(limit, "limit")
         integer(max_bytes, "max_bytes", 1024, 16 * 1024 * 1024)
         selected, size = [], 0
+        conditions, arguments = ["status='pending'"], []
+        if unassigned:
+            conditions.append(UNASSIGNED)
+        if table_name is not None:
+            conditions.append("table_name=?")
+            arguments.append(table_name)
         for record in self.connection.execute(
-            "SELECT id,table_name,payload,created_at FROM rows WHERE status='pending' ORDER BY id LIMIT ?",
-            (limit,),
+            "SELECT id,table_name,payload,created_at FROM rows WHERE "
+            + " AND ".join(conditions)
+            + " ORDER BY id LIMIT ?",
+            (*arguments, limit),
         ):
             item = {
                 "id": record["id"],
@@ -183,7 +206,7 @@ class Database:
     def peek(self, limit=50, max_bytes=8 * 1024 * 1024):
         with self.connection:
             self._expire()
-            return {"rows": self._select(limit, max_bytes)}
+            return {"rows": self._select(limit, max_bytes, unassigned=False)}
 
     def claim(self, limit=50, lease_seconds=60, max_bytes=8 * 1024 * 1024):
         integer(lease_seconds, "lease_seconds", 1, 3600)
@@ -209,6 +232,86 @@ class Database:
             )
         return {
             "message_type": "buffer.batch.v1",
+            "lease_id": token,
+            "expires_at": now + lease_seconds,
+            "rows": selected,
+        }
+
+    def claim_delivery(self, limit=50, lease_seconds=60, max_bytes=8 * 1024 * 1024):
+        """Lease one persisted, single-table HTTP delivery without regrouping it."""
+        integer(limit, "limit")
+        integer(lease_seconds, "lease_seconds", 1, 3600)
+        integer(max_bytes, "max_bytes", 1024, 16 * 1024 * 1024)
+        with self.connection:
+            self._expire()  # Acquires the write lock before selecting/preparing.
+            delivery = self.connection.execute(
+                "SELECT * FROM deliveries AS d WHERE state='pending' AND NOT EXISTS ("
+                "SELECT 1 FROM rows, json_each(d.row_ids) AS member "
+                "WHERE rows.id=member.value AND rows.status='inflight') "
+                "ORDER BY created_at,delivery_id LIMIT 1"
+            ).fetchone()
+            if delivery is not None:
+                ids = json.loads(delivery["row_ids"])
+                records = self.connection.execute(
+                    "SELECT rows.* FROM rows JOIN json_each(?) AS member "
+                    "ON rows.id=member.value ORDER BY CAST(member.key AS INTEGER)",
+                    (delivery["row_ids"],),
+                ).fetchall()
+                if len(records) != len(ids) or any(
+                    r["status"] != "pending" for r in records
+                ):
+                    raise BufferError("conflict", "saved delivery rows are unavailable")
+                selected = [
+                    {
+                        "id": r["id"],
+                        "table": r["table_name"],
+                        "row": json.loads(r["payload"]),
+                        "created_at": r["created_at"],
+                    }
+                    for r in records
+                ]
+                size = sum(
+                    len(json.dumps(r, separators=(",", ":"), allow_nan=False).encode())
+                    for r in selected
+                )
+                if len(selected) > limit or size > max_bytes:
+                    raise BufferError(
+                        "too_large",
+                        "saved delivery exceeds requested limits; cannot split it",
+                    )
+                delivery_id, table = delivery["delivery_id"], delivery["table_name"]
+            else:
+                first = self._select(1, max_bytes)
+                if not first:
+                    return {
+                        "message_type": "buffer.delivery.v1",
+                        "delivery_id": None,
+                        "table": None,
+                        "lease_id": None,
+                        "expires_at": None,
+                        "rows": [],
+                    }
+                table = first[0]["table"]
+                selected = self._select(limit, max_bytes, table_name=table)
+                ids = [r["id"] for r in selected]
+                delivery_id = str(uuid.uuid4())
+                self.connection.execute(
+                    "INSERT INTO deliveries VALUES (?,?,?,'pending',?,NULL)",
+                    (delivery_id, table, json.dumps(ids), time.time()),
+                )
+            token, now = uuid.uuid4().hex, time.time()
+            self.connection.execute(
+                "INSERT INTO leases VALUES (?,'active',?,?,?,?)",
+                (token, now + lease_seconds, json.dumps(ids), "[]", now),
+            )
+            self.connection.executemany(
+                "UPDATE rows SET status='inflight',lease_id=?,lease_until=? WHERE id=?",
+                [(token, now + lease_seconds, identity) for identity in ids],
+            )
+        return {
+            "message_type": "buffer.delivery.v1",
+            "delivery_id": delivery_id,
+            "table": table,
             "lease_id": token,
             "expires_at": now + lease_seconds,
             "rows": selected,
@@ -245,6 +348,18 @@ class Database:
                     "lease expired or was released; rows may be claimed again",
                 )
             fresh = requested - acknowledged
+            completed = []
+            for delivery in self.connection.execute(
+                "SELECT delivery_id,row_ids FROM deliveries WHERE state='pending'"
+            ):
+                delivery_ids = set(json.loads(delivery["row_ids"]))
+                if not delivery_ids & fresh:
+                    continue
+                if not delivery_ids <= fresh:
+                    raise BufferError(
+                        "invalid", "delivery must be acknowledged in full"
+                    )
+                completed.append(delivery["delivery_id"])
             self.connection.executemany(
                 "UPDATE rows SET status='sent',sent_at=? WHERE id=? AND status='inflight' AND lease_id=?",
                 [(time.time(), identity, lease_id) for identity in fresh],
@@ -257,6 +372,10 @@ class Database:
                     "acked" if acknowledged == members else "active",
                     lease_id,
                 ),
+            )
+            self.connection.executemany(
+                "UPDATE deliveries SET state='completed',completed_at=? WHERE delivery_id=?",
+                [(time.time(), identity) for identity in completed],
             )
             self._count("sent_rows_total", len(fresh))
         self.maintain()
@@ -339,6 +458,10 @@ class Database:
                 "DELETE FROM leases WHERE state!='active' AND created_at<?",
                 (now - self.receipt_retention,),
             )
+            self.connection.execute(
+                "DELETE FROM deliveries WHERE state='completed' AND completed_at<?",
+                (now - self.receipt_retention,),
+            )
         if self.disk_bytes() <= self.max_bytes:
             return
         self._reclaim()
@@ -348,7 +471,7 @@ class Database:
             ).fetchall()
             if not selected:
                 selected = self.connection.execute(
-                    "SELECT id,status FROM rows WHERE status='pending' ORDER BY id LIMIT 1000"
+                    f"SELECT id,status FROM rows WHERE status='pending' AND {UNASSIGNED} ORDER BY id LIMIT 1000"
                 ).fetchall()
             if not selected:
                 break  # Leases and retained dedup receipts cannot be discarded safely.
@@ -384,6 +507,9 @@ class Database:
             "disk_bytes": disk,
             "max_size_mb": self.max_bytes / 1024 / 1024,
             "over_limit": disk > self.max_bytes,
+            "pending_deliveries": self.connection.execute(
+                "SELECT COUNT(*) FROM deliveries WHERE state='pending'"
+            ).fetchone()[0],
             "receipts": self.connection.execute(
                 "SELECT COUNT(*) FROM receipts"
             ).fetchone()[0],

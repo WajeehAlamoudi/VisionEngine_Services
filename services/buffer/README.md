@@ -43,7 +43,8 @@ need an explicit schema migration rather than silent reuse.
 |---|---|
 | `put(batch_id, batch)` | Transactional rows + receipt; repeated identical ID returns receipt |
 | `peek(limit, max_bytes)` | Read pending rows without reserving them |
-| `claim(limit, lease_seconds, max_bytes)` | Reserve oldest rows for an ingest consumer |
+| `claim(limit, lease_seconds, max_bytes)` | Reserve oldest unassigned rows for an existing ingest consumer |
+| `claim_delivery(limit, lease_seconds, max_bytes)` | Persist/lease one single-table delivery with a stable UUIDv4 |
 | `renew(lease_id, lease_seconds)` | Extend a live lease |
 | `ack(lease_id, ids?)` | Mark all/specified members sent after backend confirmation |
 | `release(lease_id)` | Return unconfirmed members to pending |
@@ -62,13 +63,47 @@ rejected. Receipts remain at least seven days by default and while rows remain.
 Deduplication after receipt/row retention expires is not guaranteed. This local
 protocol does not provide backend exactly-once delivery.
 
+## Persistent HTTP delivery identity
+
+`claim_delivery` is an opt-in RPC operation for future ingest/backend integration.
+It returns `buffer.delivery.v1` with `delivery_id` (UUIDv4), `table`, `lease_id`,
+`expires_at` and the existing row envelopes. Empty replies have null IDs/table
+and an empty row list. UUID and row membership commit in SQLite before reply.
+
+An additive schema-v2 migration creates `deliveries` with `delivery_id` (primary
+key), `table_name`, `row_ids` (ordered JSON IDs), `state`, `created_at` and
+`completed_at`. Existing rows, producer receipts and leases are preserved.
+Version-1 buffer code cannot open a version-2 database; retain a pre-upgrade
+backup if a code rollback is needed.
+
+Released/expired deliveries retain their UUID, order, table and exact payloads
+across restarts. A retry uses a new temporary lease but the same delivery UUID.
+Existing pending deliveries are retried before preparing new unassigned work;
+live leases are skipped. Lower retry limits return `too_large` rather than split
+an existing delivery. Retrying consumers must retain compatible row/byte limits.
+
+Use `renew`/`release` with the lease token and `ack` only after backend success.
+Saved deliveries require a full ACK; it marks their rows sent and the delivery
+completed in one transaction. Repeated ACKs are safe within retained lease
+metadata. Pending delivery members cannot be taken by legacy `claim` or evicted
+under capacity pressure. `peek` still shows released pending rows. Completed
+delivery metadata is retained for `receipt_days`; pending metadata never expires.
+`pending_deliveries` is included in stats, health snapshots and published status.
+
+Updated ingest uses `claim_delivery` and sends `delivery_id` as the backend
+`batch_id`. Deploy the receipt-aware backend first, then this buffer, then ingest.
+The backend must atomically store its receipt and destination rows and echo the
+UUID with the confirmed row count. HTTP retries reuse the saved delivery, never
+repackage uncertain rows under a new UUID. Legacy `claim` remains available for
+older clients but provides no backend delivery identity.
+
 ## Capacity and pending meaning
 
 `pending` is all unsent work, including leased rows; `inflight` is the leased
 subset. Sent retention uses `delete_after_hours`; zero removes sent rows promptly.
 Cleanup accounts for DB/WAL/shared-memory files, checkpoints and reclaims pages.
 Under pressure it removes sent rows before oldest pending rows, exposing
-`dropped_pending_total`. Active leases and unexpired receipts are protected; new
+`dropped_pending_total`. Active leases, pending deliveries and unexpired receipts are protected; new
 writes can be rejected for retry if protected data fills capacity.
 
 `max_size_mb` is an operational target, not a hard filesystem quota. A single batch
