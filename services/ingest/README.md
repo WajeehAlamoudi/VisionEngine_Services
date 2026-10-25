@@ -17,7 +17,7 @@
 | Property | Value |
 |---|---|
 | Instance scope | One shared worker |
-| Input | Leased buffer.batch.v1 |
+| Input | Leased buffer.delivery.v1 with persistent UUIDv4 |
 | Output | HTTP table batches + status |
 | Image | `visionengine-ingest:local` |
 | Generated file | `config/.generated/ingest.compose.yaml` |
@@ -25,20 +25,22 @@
 
 ## Delivery flow
 
-Ingest requests rows from buffer RPC, groups by table without changing row payloads,
-POSTs each group, and acknowledges confirmed row IDs. It creates no separate
-database or persistence volume. Buffer remains the durable owner.
+Ingest requests one saved delivery through buffer RPC (`claim_delivery`). Buffer
+owns its UUIDv4, destination table and exact ordered rows. Ingest POSTs that
+delivery unchanged and acknowledges its complete row list only after matching
+backend confirmation. It creates no UUIDs, separate database or persistence
+volume; buffer remains the durable owner.
 
 ```mermaid
 sequenceDiagram
     participant I as Ingest
     participant B as Buffer
     participant A as Backend
-    I->>B: Claim rows with lease
-    B-->>I: Leased batch
+    I->>B: Claim saved delivery with lease
+    B-->>I: Persistent UUID + table + exact rows + lease
     I->>B: Renew live lease
-    I->>A: POST table + rows
-    A-->>I: Confirm table and inserted count
+    I->>A: POST batch_id + table + rows
+    A-->>I: Confirm batch_id, table and original inserted count
     I->>B: Acknowledge confirmed IDs
 ```
 
@@ -49,14 +51,25 @@ POST <api.url>/branches/ingest
 X-API-Key: <api.key>
 Content-Type: application/json
 
-{"table":"notifications","rows":[{"rule_name":"entrance_alert","severity":"warning"}]}
+{"batch_id":"9fcf4c84-55ca-4b67-94ac-61f434a893e2","table":"notifications","rows":[{"rule_name":"entrance_alert","severity":"warning"}]}
 ```
 
 The body illustrates shape; actual rows have row-builder fields. Backend key
 selects the branch; branch ID is not added to this body. Confirmation requires
-HTTP 200/201, `success: true`, and matching `data.table`/`data.inserted` count.
-Empty/malformed/wrong-count responses, timeouts and rejected requests leave the
-relevant rows unsent. Successful table groups can ACK while failed groups retry.
+HTTP 200/201, `success: true`, a matching `data.batch_id` and `data.table`, and an
+integer `data.inserted` equal to the delivery row count. Example confirmation:
+
+```json
+{"success":true,"data":{"batch_id":"9fcf4c84-55ca-4b67-94ac-61f434a893e2","table":"notifications","inserted":1}}
+```
+
+The backend must atomically store its receipt and destination rows. On an
+identical retry it returns the same UUID, table and original confirmed row count,
+even though it inserts no new rows. An additional `duplicate: true` field is
+allowed but is not required by ingest. A mismatched payload for an existing ID
+must be rejected by the backend. Empty/malformed/missing-ID/wrong-count responses,
+timeouts and rejected requests leave the delivery unconfirmed. There is no
+fallback to unidentified legacy requests.
 
 `api.ingest` controls batching/flush cadence. `api.request` controls timeout and
 failure-warning threshold; `api.buffer.retry_interval_seconds` supplies backoff
@@ -66,16 +79,22 @@ backend URLs, row bodies and raw response bodies.
 
 ## Recovery and delivery limits
 
-Live leases renew before table requests. ACK loss retries the same ACK before
-new HTTP, avoiding repost merely because a live worker missed a buffer response.
-Failed members are released for retry. A killed worker's leases expire. Stop
-finishes the bounded active request/ACK attempt and releases unsent rows; it does
-not drain the entire backlog.
+Live leases renew before HTTP requests. ACK loss retries the same ACK before new
+HTTP, avoiding repost merely because a live worker missed a buffer response.
+Failed deliveries are released for retry; their saved UUID and membership remain.
+A killed worker's leases expire. Buffer restart/lease recovery returns the same
+delivery, including when the backend committed before the worker died. New rows
+are never merged into that retry. Stop finishes the bounded active request/ACK
+attempt and releases unsent work; it does not drain the entire backlog.
 
 > [!IMPORTANT]
-> Backend delivery is **at least once**. If insertion succeeds but its HTTP response
-> is lost, or a process dies before buffer ACK commits, retries can insert duplicates.
-> Exact-once backend storage requires backend idempotency support.
+> Deploy the receipt-aware backend first, then the updated buffer, then ingest.
+> The backend must enforce uniqueness on `(branch_id, batch_id)` and retain receipts
+> for as long as a delivery can be retried. The client still makes at-least-once
+> attempts; backend receipts prevent repeat inserts. An older backend may insert
+> rows while omitting the required UUID confirmation, causing repeated requests.
+> Do not point this ingest at that older API. Smaller batch/byte limits must still
+> accommodate saved deliveries; buffer refuses to split an existing delivery.
 
 `ambiguous_rows_total` reports observed uncertainty, not every actual duplicate.
 Buffer capacity handling still applies during long outages.

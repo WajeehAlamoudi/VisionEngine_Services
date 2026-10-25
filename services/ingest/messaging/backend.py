@@ -1,4 +1,4 @@
-"""Current backend HTTP contract with bounded response and total request deadline."""
+"""Batch-identified HTTP delivery with bounded response and total deadline."""
 
 import asyncio
 from dataclasses import dataclass
@@ -30,7 +30,7 @@ class Backend:
             headers={"X-API-Key": api.key},
         )
 
-    async def push(self, table, records):
+    async def push(self, table, records, *, batch_id):
         started = time.monotonic()
         status = None
 
@@ -45,6 +45,7 @@ class Backend:
                     "POST",
                     self.url,
                     json={
+                        "batch_id": batch_id,
                         "table": table,
                         "rows": [record["row"] for record in records],
                     },
@@ -62,11 +63,12 @@ class Backend:
                     if (
                         document.get("success") is not True
                         or not isinstance(data, dict)
+                        or data.get("batch_id") != batch_id
                         or data.get("table") != table
                         or type(data.get("inserted")) is not int
                         or data["inserted"] != len(records)
                     ):
-                        return result(False, "unconfirmed_insert_count", True)
+                        return result(False, "unconfirmed_delivery", True)
                     return result(True, "accepted")
         except (asyncio.TimeoutError, httpx.TimeoutException):
             return result(False, "timeout", True)

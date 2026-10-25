@@ -1,10 +1,10 @@
-"""Serial table-group delivery, expiring buffer leases and retry backoff."""
+"""Persistent buffer deliveries, expiring leases and retry backoff."""
 
 import asyncio
-from collections import defaultdict
 import logging
 import threading
 import time
+import uuid
 
 from ..messaging.backend import Backend
 from ..messaging.buffer import Client, BufferError
@@ -157,107 +157,114 @@ class IngestWorker(threading.Thread):
 
     async def flush(self, client, backend):
         self.state("flushing")
-        lease = client.request(
-            "claim",
+        delivery = client.request(
+            "claim_delivery",
             limit=self.api.ingest.batch_size,
             lease_seconds=self.lease_seconds,
             max_bytes=self.claim_max_bytes,
         )
         if (
-            not isinstance(lease, dict)
-            or lease.get("message_type") != "buffer.batch.v1"
-            or not isinstance(lease.get("rows"), list)
+            not isinstance(delivery, dict)
+            or delivery.get("message_type") != "buffer.delivery.v1"
+            or not isinstance(delivery.get("rows"), list)
         ):
-            raise ValueError("invalid buffer batch")
-        if not lease["rows"]:
+            raise ValueError("invalid buffer delivery")
+        if not delivery["rows"]:
             return False
-        if not isinstance(lease.get("lease_id"), str):
+        if not isinstance(delivery.get("lease_id"), str) or not delivery["lease_id"]:
             raise ValueError("missing lease")
-        self.current_lease = lease["lease_id"]
-        groups = defaultdict(list)
-        identities = set()
-        for record in lease["rows"]:
-            if (
-                not isinstance(record, dict)
-                or type(record.get("id")) is not int
-                or record["id"] in identities
-                or not isinstance(record.get("table"), str)
-                or not isinstance(record.get("row"), dict)
-            ):
-                raise ValueError("invalid leased row")
-            identities.add(record["id"])
-            groups[record["table"]].append(record)
-        self.update(flushes=self.snapshot()["flushes"] + 1)
-        failed = False
+        self.current_lease = delivery["lease_id"]
         try:
-            for table, records in groups.items():
-                if self.stop.is_set():
-                    break
-                # Extend only a live lease, before issuing another backend request.
-                client.request(
-                    "renew",
-                    lease_id=self.current_lease,
-                    lease_seconds=self.lease_seconds,
-                )
-                self.state("posting")
-                result = await backend.push(table, records)
-                status = self.snapshot()
-                self.update(
-                    http_requests_total=status["http_requests_total"] + 1,
-                    last_http_ms=result.elapsed_ms,
-                    last_http_status=result.status_code,
-                    backend_available=result.success,
-                )
-                if not result.success:
-                    failed = True
-                    if result.ambiguous:
-                        self.update(
-                            ambiguous_rows_total=self.snapshot()["ambiguous_rows_total"]
-                            + len(records)
-                        )
-                    log.warning(
-                        "backend request not confirmed",
-                        extra={
-                            "stage": "output",
-                            "event": "http_failed",
-                            "fields": {
-                                "table": table,
-                                "rows": len(records),
-                                "http_status": result.status_code,
-                                "reason": result.reason,
-                            },
-                        },
+            batch_id, table, records = (
+                delivery.get("delivery_id"),
+                delivery.get("table"),
+                delivery["rows"],
+            )
+            if not isinstance(batch_id, str):
+                raise ValueError("missing delivery UUID")
+            identity = uuid.UUID(batch_id)
+            if identity.version != 4 or str(identity) != batch_id:
+                raise ValueError("invalid delivery UUIDv4")
+            if not isinstance(table, str) or not table:
+                raise ValueError("invalid delivery table")
+            identities = set()
+            for record in records:
+                if (
+                    not isinstance(record, dict)
+                    or type(record.get("id")) is not int
+                    or record["id"] < 1
+                    or record["id"] in identities
+                    or record.get("table") != table
+                    or not isinstance(record.get("row"), dict)
+                ):
+                    raise ValueError("invalid delivery row")
+                identities.add(record["id"])
+            self.update(flushes=self.snapshot()["flushes"] + 1)
+            if self.stop.is_set():
+                return False
+            # The buffer owns the UUID and grouping; never repackage retries here.
+            client.request(
+                "renew",
+                lease_id=self.current_lease,
+                lease_seconds=self.lease_seconds,
+            )
+            self.state("posting")
+            result = await backend.push(table, records, batch_id=batch_id)
+            status = self.snapshot()
+            self.update(
+                http_requests_total=status["http_requests_total"] + 1,
+                last_http_ms=result.elapsed_ms,
+                last_http_status=result.status_code,
+                backend_available=result.success,
+            )
+            if not result.success:
+                if result.ambiguous:
+                    self.update(
+                        ambiguous_rows_total=self.snapshot()["ambiguous_rows_total"]
+                        + len(records)
                     )
-                    continue
-                self.update(
-                    http_rows_accepted_total=self.snapshot()["http_rows_accepted_total"]
-                    + len(records)
-                )
-                self.pending_ack = (
-                    self.current_lease,
-                    [record["id"] for record in records],
-                )
-                self.update(ack_pending_rows=len(records))
-                if not self.retry_ack(client):
-                    self.state("ack_pending")
-                    return True
-                log.info(
-                    "table rows delivered",
+                log.warning(
+                    "backend request not confirmed",
                     extra={
                         "stage": "output",
-                        "event": "rows_delivered",
+                        "event": "http_failed",
                         "fields": {
+                            "batch_id": batch_id,
                             "table": table,
                             "rows": len(records),
-                            "http_ms": round(result.elapsed_ms, 2),
+                            "http_status": result.status_code,
+                            "reason": result.reason,
                         },
                     },
                 )
-            if failed:
-                self.update(backend_available=False)
-                self.failed("backend_request_failed")
-            else:
-                self.update(consecutive_failures=0, dependency_error=None)
+                self.failed("backend_request_failed", batch_id=batch_id)
+                return True
+            self.update(
+                http_rows_accepted_total=self.snapshot()["http_rows_accepted_total"]
+                + len(records)
+            )
+            self.pending_ack = (
+                self.current_lease,
+                [record["id"] for record in records],
+            )
+            self.update(ack_pending_rows=len(records))
+            if not self.retry_ack(client):
+                self.state("ack_pending")
+                return True
+            log.info(
+                "table rows delivered",
+                extra={
+                    "stage": "output",
+                    "event": "rows_delivered",
+                    "fields": {
+                        "batch_id": batch_id,
+                        "table": table,
+                        "rows": len(records),
+                        "http_ms": round(result.elapsed_ms, 2),
+                    },
+                },
+            )
+            self.update(consecutive_failures=0, dependency_error=None)
         finally:
             self.release(client)
             self.update(
