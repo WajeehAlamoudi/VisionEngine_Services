@@ -51,7 +51,7 @@ class Backend:
                     },
                 ) as response:
                     status = response.status_code
-                    if status not in (200, 201):
+                    if status not in (200, 201, 409):
                         return result(False, "http_error", status >= 500)
                     payload = bytearray()
                     async for chunk in response.aiter_bytes(chunk_size=4096):
@@ -59,6 +59,19 @@ class Backend:
                         if len(payload) > MAX_RESPONSE_BYTES:
                             return result(False, "oversized_response", True)
                     document = json.loads(payload)
+                    if status == 409:
+                        error = (
+                            document.get("error")
+                            if isinstance(document, dict)
+                            else None
+                        )
+                        if (
+                            isinstance(error, dict)
+                            and document.get("success") is False
+                            and error.get("code") == "BATCH_ID_CONFLICT"
+                        ):
+                            return result(False, "batch_id_conflict")
+                        return result(False, "http_error")
                     data = document.get("data") if isinstance(document, dict) else None
                     if (
                         document.get("success") is not True
@@ -75,7 +88,11 @@ class Backend:
         except httpx.RequestError:
             return result(False, "connection_error", True)
         except (ValueError, TypeError, AttributeError):
-            return result(False, "invalid_response", True)
+            return result(
+                False,
+                "http_error" if status == 409 else "invalid_response",
+                status != 409,
+            )
 
     async def close(self):
         await self.client.aclose()

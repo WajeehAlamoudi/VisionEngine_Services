@@ -77,6 +77,27 @@ base, multiplied 1, 2, 4, then capped at 5. Warning threshold does not discard w
 Responses are bounded to 64 KiB; redirects are rejected. Logs omit credentials,
 backend URLs, row bodies and raw response bodies.
 
+## Batch ID conflicts
+
+Only HTTP 409 with `success: false` and `error.code: "BATCH_ID_CONFLICT"` pauses
+all automatic backend delivery. Ingest releases the temporary lease, retains the
+saved delivery and its rows, and logs the UUID/table/count without payloads.
+It never acknowledges the rejected rows or generates a replacement delivery ID.
+
+The worker remains alive with fresh heartbeats in `state: "blocked"`; snapshots
+and published status include `blocked_batch_id` and
+`dependency_error: "batch_id_conflict"`. Pending counts are unknown while paused
+because the worker no longer polls/claims work. The existing healthcheck reports
+this state unhealthy, so operator attention is visible. The worker does not exit
+or start a retry loop. Other HTTP 409 codes and temporary errors retain the
+existing retry/backoff behavior. Matching duplicate receipts still return 200
+and complete normally.
+
+This minimal pause is held in memory until ingest restarts. A restart attempts
+the saved delivery again and pauses again if the conflict remains. Investigate
+the saved UUID/content and backend receipt before resuming. No buffer schema or
+per-batch quarantine is added by this handling; all backend delivery pauses.
+
 ## Recovery and delivery limits
 
 Live leases renew before HTTP requests. ACK loss retries the same ACK before new

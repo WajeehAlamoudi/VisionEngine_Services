@@ -61,6 +61,7 @@ class IngestWorker(threading.Thread):
             "last_http_status": None,
             "pending": None,
             "dependency_error": None,
+            "blocked_batch_id": None,
             "buffer_available": None,
             "backend_available": None,
         }
@@ -156,6 +157,9 @@ class IngestWorker(threading.Thread):
             self.current_lease = None
 
     async def flush(self, client, backend):
+        if self.snapshot()["blocked_batch_id"] is not None:
+            self.state("blocked")
+            return False
         self.state("flushing")
         delivery = client.request(
             "claim_delivery",
@@ -218,6 +222,29 @@ class IngestWorker(threading.Thread):
                 backend_available=result.success,
             )
             if not result.success:
+                if result.reason == "batch_id_conflict":
+                    self.update(
+                        blocked_batch_id=batch_id,
+                        dependency_error="batch_id_conflict",
+                        pending=None,
+                        consecutive_failures=status["consecutive_failures"] + 1,
+                        failures_total=status["failures_total"] + 1,
+                    )
+                    self.state("blocked")
+                    log.error(
+                        "batch ID conflict; delivery paused and rows retained for investigation",
+                        extra={
+                            "stage": "output",
+                            "event": "batch_id_conflict",
+                            "fields": {
+                                "batch_id": batch_id,
+                                "table": table,
+                                "rows": len(records),
+                                "http_status": result.status_code,
+                            },
+                        },
+                    )
+                    return True
                 if result.ambiguous:
                     self.update(
                         ambiguous_rows_total=self.snapshot()["ambiguous_rows_total"]
@@ -279,6 +306,10 @@ class IngestWorker(threading.Thread):
         next_flush = time.monotonic()
         try:
             while not self.stop.is_set():
+                if self.snapshot()["blocked_batch_id"] is not None:
+                    self.state("blocked")
+                    await self.wait(self.poll_interval)
+                    continue
                 if self.pending_ack is not None:
                     self.state("ack_pending")
                     if self.retry_ack(client):
