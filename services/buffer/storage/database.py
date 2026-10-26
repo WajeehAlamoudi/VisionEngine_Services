@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS receipts (
     batch_id TEXT PRIMARY KEY, digest TEXT NOT NULL, row_count INTEGER NOT NULL,
     created_at REAL NOT NULL
 );
+-- Bound retention/expiry work by eligible records rather than all history.
+CREATE INDEX IF NOT EXISTS receipts_created_at ON receipts(created_at);
 CREATE TABLE IF NOT EXISTS rows (
     id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
     table_name TEXT NOT NULL, payload TEXT NOT NULL,
@@ -24,16 +26,20 @@ CREATE TABLE IF NOT EXISTS rows (
 );
 CREATE INDEX IF NOT EXISTS rows_status_id ON rows(status,id);
 CREATE INDEX IF NOT EXISTS rows_batch ON rows(batch_id);
+CREATE INDEX IF NOT EXISTS rows_status_sent_at ON rows(status,sent_at);
 CREATE TABLE IF NOT EXISTS leases (
     token TEXT PRIMARY KEY, state TEXT NOT NULL, expires_at REAL NOT NULL,
     ids TEXT NOT NULL, acked TEXT NOT NULL, created_at REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS leases_active_expiry ON leases(expires_at) WHERE state='active';
+CREATE INDEX IF NOT EXISTS leases_created_at ON leases(created_at);
 CREATE TABLE IF NOT EXISTS deliveries (
     delivery_id TEXT PRIMARY KEY, table_name TEXT NOT NULL, row_ids TEXT NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('pending','completed')),
     created_at REAL NOT NULL, completed_at REAL
 );
 CREATE INDEX IF NOT EXISTS deliveries_state ON deliveries(state,created_at);
+CREATE INDEX IF NOT EXISTS deliveries_state_completed_at ON deliveries(state,completed_at);
 CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 """
 
@@ -164,8 +170,7 @@ class Database:
             )
             self._count("batches_total")
             self._count("received_rows_total", len(batch["rows"]))
-        # The receipt and rows are committed together before acknowledging.
-        self.maintain()
+        # Confirm immediately after durable commit; scheduled cleanup is separate.
         return {"batch_id": batch_id, "stored": len(batch["rows"]), "duplicate": False}
 
     def _select(self, limit, max_bytes, *, table_name=None, unassigned=True):
@@ -378,7 +383,7 @@ class Database:
                 [(time.time(), identity) for identity in completed],
             )
             self._count("sent_rows_total", len(fresh))
-        self.maintain()
+        # The service schedules cleanup after replying, not in this ACK path.
         return {"acked": len(requested), "duplicate": False}
 
     def renew(self, lease_id, lease_seconds=60):
@@ -435,10 +440,8 @@ class Database:
 
     def _reclaim(self):
         self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        for _ in range(1024):
-            if self.connection.execute("PRAGMA freelist_count").fetchone()[0] == 0:
-                break
-            self.connection.execute("PRAGMA incremental_vacuum(1)")
+        # One bounded operation avoids a separate FULL-sync transaction per page.
+        self.connection.execute("PRAGMA incremental_vacuum(1024)").fetchall()
         self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def maintain(self):

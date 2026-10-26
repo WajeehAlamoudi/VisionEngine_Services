@@ -37,6 +37,15 @@ not by generation or inside an image. SQLite uses WAL, `synchronous=FULL`, a bus
 timeout and transactions. Storage must honor flushes. Legacy monolithic databases
 need an explicit schema migration rather than silent reuse.
 
+New puts acknowledge immediately after the receipt and rows durably commit;
+row-delivery ACKs likewise return after their transaction. Neither path runs
+cleanup before replying. The service schedules cleanup separately every five
+seconds, after sending any current RPC reply. SQLite remains owned by one serving
+thread; this is separate scheduled work, not concurrent writers. Retention and
+lease-expiry indexes keep that work from scanning all historical metadata.
+Compaction reclaims up to 1024 pages in one completed SQLite operation rather
+than issuing a separate FULL-sync operation for every page.
+
 ## Request/reply operations
 
 | Operation | Result |
