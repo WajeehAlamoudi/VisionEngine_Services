@@ -79,20 +79,29 @@ class Inbox:
             key: CameraQueue(max_items, max_bytes, max_age_ms) for key in inputs
         }
         self.order = deque(inputs)
+        self.ready = threading.Condition()
 
     def put(self, key, batch, size):
-        self.queues[key].put(batch, size)
+        with self.ready:
+            self.queues[key].put(batch, size)
+            self.ready.notify()
 
     def reject(self, camera_id):
         self.queues[camera_id].reject()
 
-    def pop(self):
-        for _ in range(len(self.order)):
-            key = self.order[0]
-            self.order.rotate(-1)
-            batch = self.queues[key].pop()
-            if batch is not None:
-                return key, batch
+    def pop(self, stop=None):
+        with self.ready:
+            while stop is None or not stop.is_set():
+                for _ in range(len(self.order)):
+                    key = self.order[0]
+                    self.order.rotate(-1)
+                    batch = self.queues[key].pop()
+                    if batch is not None:
+                        return key, batch
+                if stop is None:
+                    return None
+                # Incoming work notifies immediately; timeout only checks shutdown.
+                self.ready.wait(0.1)
         return None
 
     def snapshot(self):
@@ -147,9 +156,8 @@ class RowWorker(threading.Thread):
             )
             self.state("waiting")
             while not self.stop.is_set():
-                incoming = self.inbox.pop()
+                incoming = self.inbox.pop(self.stop)
                 if incoming is None:
-                    self.stop.wait(0.01)
                     continue
                 source, batch = incoming
                 # Events and alerts share sequence IDs but are independent inputs.

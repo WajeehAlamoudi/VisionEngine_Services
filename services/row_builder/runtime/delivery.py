@@ -32,6 +32,7 @@ class Journal:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
+        self.ready = threading.Condition(self.lock)
         self.max_items, self.max_bytes = max_items, max_bytes
         self.connection = sqlite3.connect(
             self.path, check_same_thread=False, timeout=10
@@ -54,7 +55,7 @@ class Journal:
         if size > self.max_bytes:
             raise ValueError("row batch exceeds delivery journal byte capacity")
         while not stop.is_set():
-            with self.lock:
+            with self.ready:
                 if self.connection.execute(
                     "SELECT 1 FROM pending WHERE batch_id=?", (identity,)
                 ).fetchone():
@@ -68,20 +69,33 @@ class Journal:
                             "INSERT INTO pending(batch_id,payload,bytes) VALUES (?,?,?)",
                             (identity, payload, size),
                         )
+                    self.ready.notify_all()
                     return True
-            stop.wait(0.05)
+                # ACKs notify space availability; timeout only checks shutdown.
+                self.ready.wait(0.1)
         return False
 
-    def first(self):
-        with self.lock:
-            row = self.connection.execute(
-                "SELECT batch_id,payload FROM pending ORDER BY id LIMIT 1"
-            ).fetchone()
-            return (row[0], json.loads(row[1])) if row else None
+    def first(self, stop=None):
+        with self.ready:
+            while stop is None or not stop.is_set():
+                row = self.connection.execute(
+                    "SELECT batch_id,payload FROM pending ORDER BY id LIMIT 1"
+                ).fetchone()
+                if row:
+                    return row[0], json.loads(row[1])
+                if stop is None:
+                    return None
+                # Appends notify after commit; timeout only checks shutdown.
+                self.ready.wait(0.1)
+        return None
 
     def acknowledged(self, identity):
-        with self.lock, self.connection:
-            self.connection.execute("DELETE FROM pending WHERE batch_id=?", (identity,))
+        with self.ready:
+            with self.connection:
+                self.connection.execute(
+                    "DELETE FROM pending WHERE batch_id=?", (identity,)
+                )
+            self.ready.notify_all()
 
     def snapshot(self):
         with self.lock:
@@ -116,12 +130,11 @@ class Delivery(threading.Thread):
     def run(self):
         client = Client(self.endpoint, self.timeout_ms)
         try:
+            with self.lock:
+                self.status["state"] = "waiting"
             while not self.stop.is_set():
-                item = self.journal.first()
+                item = self.journal.first(self.stop)
                 if item is None:
-                    with self.lock:
-                        self.status["state"] = "waiting"
-                    self.stop.wait(0.05)
                     continue
                 identity, batch = item
                 try:
