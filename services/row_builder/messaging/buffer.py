@@ -35,24 +35,36 @@ class Client:
     def __init__(self, endpoint, timeout_ms=2000):
         self.endpoint, self.timeout_ms = endpoint, timeout_ms
         self.context = zmq.Context()
+        self.socket = None
+
+    def _reset(self):
+        if self.socket is not None:
+            self.socket.close(linger=0)
+            self.socket = None
 
     def request(self, operation, **arguments):
         request_id = uuid.uuid4().hex
         payload = encode(
             {"version": 1, "request_id": request_id, "op": operation, **arguments}
         )
-        with self.context.socket(zmq.REQ) as socket:
-            socket.setsockopt(zmq.LINGER, 0)
-            socket.setsockopt(zmq.SNDTIMEO, self.timeout_ms)
-            socket.setsockopt(zmq.MAXMSGSIZE, MAX_MESSAGE_BYTES)
-            socket.connect(self.endpoint)
-            try:
-                socket.send(payload)
-                if not socket.poll(self.timeout_ms):
-                    raise TimeoutError("buffer acknowledgement timed out")
-                reply = decode(socket.recv())
-            except zmq.Again as exc:
-                raise TimeoutError("buffer request timed out") from exc
+        if self.socket is None:
+            self.socket = self.context.socket(zmq.REQ)
+            self.socket.setsockopt(zmq.LINGER, 0)
+            self.socket.setsockopt(zmq.SNDTIMEO, self.timeout_ms)
+            self.socket.setsockopt(zmq.MAXMSGSIZE, MAX_MESSAGE_BYTES)
+            self.socket.connect(self.endpoint)
+        try:
+            self.socket.send(payload)
+            if not self.socket.poll(self.timeout_ms):
+                raise TimeoutError("buffer acknowledgement timed out")
+            reply = decode(self.socket.recv())
+        except zmq.Again as exc:
+            self._reset()
+            raise TimeoutError("buffer request timed out") from exc
+        except Exception:
+            # A REQ socket cannot send another request until its reply arrives.
+            self._reset()
+            raise
         if reply.get("request_id") != request_id or reply.get("version") != 1:
             raise ValueError("uncorrelated buffer reply")
         if not reply.get("ok"):
@@ -63,4 +75,5 @@ class Client:
         return reply["result"]
 
     def close(self):
+        self._reset()
         self.context.term()
