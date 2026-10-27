@@ -79,18 +79,26 @@ Physical durability depends on storage honoring filesystem flushes.
 
 ## Buffer and producer journal
 
-Only buffer opens its SQLite database. Row builder first journals each nonempty
-batch locally, then retries a stable batch ID until buffer confirms commit. Buffer
-retains dedup receipts. Ingest claims with a lease, confirms the backend response,
-then acknowledges successful rows.
+Only buffer opens its SQLite database. Row builder journals each nonempty batch
+with a UUIDv4, sequence and SHA-256, then retries until buffer durably commits.
+Producer retirement checkpoints allow local source deduplication records to be
+deleted without accepting delayed old retries. One checkpoint per producer remains.
+Ingest polling, grouping and stable backend delivery UUIDs are unchanged.
 
-`pending` includes leased unsent rows; `inflight` is that leased subset. Expired
-leases make rows claimable again. `delete_after_hours` applies to sent rows. Under
-capacity pressure, sent rows go first, then oldest unleased pending rows; loss is
-counted. Protected leases/receipts may cause write rejection and retry.
-`max_size_mb` includes database/WAL/shared-memory size as an operational target,
-not a hard filesystem quota. Backend retries can still duplicate inserts.
-[Buffer](../services/buffer/README.md) Â· [Ingest](../services/ingest/README.md)
+`pending` includes leased unsent rows; `inflight` is its leased subset.
+Confirmed payloads/completed delivery records are deleted after backend ACK.
+Completed ACK replay tokens are bounded to 1024 and expire with their lease.
+There is no seven-day receipt/lease/delivery history; `delete_after_hours` is
+accepted but no longer retains delivered payloads. Pending rows are never evicted
+for capacity. New intake can be rejected while live data fills the buffer.
+
+Schema v3 requires fresh coordinated buffer/journal storage for the development
+reset; old data is never automatically deleted. Main database pages are capped,
+with intake headroom; physical WAL/SHM bytes can exceed the main-page cap.
+A separate bounded maintenance connection reclaims space; SQLite still serializes
+writers. Finite storage and upstream queues can still fill during an outage.
+[Buffer](../services/buffer/README.md) · [Ingest](../services/ingest/README.md) ·
+[Buffer handoff and measurements](BUFFER_HANDOFF.md)
 
 ## What survives?
 

@@ -23,101 +23,146 @@
 | Generated file | `config/.generated/buffer.compose.yaml` |
 | Entry point | `python -m services.buffer` |
 
-## Storage owner
+## Storage owner and responsibilities
 
-Only this process opens buffer SQLite. It accepts detection, notification and
-node rows, commits batches with receipts, and serves leased rows to ingest.
-No separate SQL-server image is needed. No backend table creation occurs here.
+Only buffer opens its SQLite database. It stores detection, notification and node
+rows, and serves the existing ingest claims. It does not store camera images or
+monitor snapshot files. Ingest polling, the configurable row batch size (currently
+50) and flush interval (currently 5 seconds), HTTP grouping and backend UUIDs are
+unchanged.
 
-`api.yaml` owns `buffer.path`, `max_size_mb`, `retry_interval_seconds` and
-`delete_after_hours`; `device.yaml` supplies identity. `api.buffer.path` resolves
-from the runtime working directory. Compose mounts its parent directory on
-`buffer_data`, commonly `/app/data/buffer.db`. The database is created at runtime,
-not by generation or inside an image. SQLite uses WAL, `synchronous=FULL`, a busy
-timeout and transactions. Storage must honor flushes. Legacy monolithic databases
-need an explicit schema migration rather than silent reuse.
+| Responsibility | Owner / tables |
+|---|---|
+| Intake: validate, persist, acknowledge | RPC serving thread; one short transaction |
+| Pending payload | `rows`, with destination table and lease state |
+| Producer duplicate protection | `producers` checkpoints and `source_batches` for unretired handoffs only |
+| HTTP delivery/recovery | `deliveries` for unfinished groups; `leases` for live/recent claims |
+| Bounded cleanup/reclamation | Separate maintenance thread and SQLite connection |
 
-New puts acknowledge immediately after the receipt and rows durably commit;
-row-delivery ACKs likewise return after their transaction. Neither path runs
-cleanup before replying. The service schedules cleanup separately every five
-seconds, after sending any current RPC reply. SQLite remains owned by one serving
-thread; this is separate scheduled work, not concurrent writers. Retention and
-lease-expiry indexes keep that work from scanning all historical metadata.
-Compaction reclaims up to 1024 pages in one completed SQLite operation rather
-than issuing a separate FULL-sync operation for every page.
+These are logical responsibilities in one database, not independent SQLite
+schemas/writers. SQLite still serializes writes. Intake never calls cleanup
+before replying. Cleanup runs every second, deletes at most 256 expired tokens per
+pass, uses a 20 ms lock timeout to yield to serving work, a passive WAL checkpoint,
+and incremental reclamation of at most 64 pages. Errors are surfaced by the
+service rather than silently disabling maintenance.
+
+`api.yaml` supplies `buffer.path`, `max_size_mb` and retry settings.
+`delete_after_hours` remains accepted for configuration compatibility; confirmed
+payloads are now deleted in the backend ACK transaction, rather than retained for
+hours. There is no seven-day receipt retention or `--receipt-days` setting.
+WAL and `synchronous=FULL` are retained. Physical durability requires storage that
+honors flushes.
+
+## Producer handoff: UUID, SHA-256 and retirement
+
+Each new journal entry has a persistent UUIDv4, a monotonically increasing
+sequence, and SHA-256 over canonical JSON of its `rows` (sorted keys, compact
+separators, finite numbers). A persistent producer UUID identifies the journal,
+not a camera or process lifetime. Retries preserve identity, sequence and content.
+
+A put carries `batch_id`, `batch`, `producer_id`, `sequence`, `digest`, and
+`retired_through`. Buffer checks the hash and identity and atomically stores the
+source record, rows and saved checkpoint. It replies only after commit.
+Same UUID/sequence/hash returns the original row count without another insert.
+Conflicting identity/content or a sequence gap is rejected. This is transactional
+validation, not a separate background check that could race an insert.
+
+Row builder advances `retired_through` only in the transaction deleting its
+oldest confirmed journal entry. Buffer removes source UUID/hash records through
+that checkpoint without deleting their undelivered rows. Continuous traffic
+piggybacks retirement on puts; an idle journal explicitly sends `retire`, including
+after restart. Buffer retains one saved/retired checkpoint per producer. Old
+messages at or below retirement are acknowledged and ignored even after their
+source UUID/hash has been removed. A count of zero waiting batches alone is not
+used as a deletion fence.
+
+A journal must not be rolled back to an older backup against newer buffer state.
+Do not erase the producer/checkpoint tables independently to recover capacity.
+An abandoned producer leaves its checkpoint and any unretired handoffs; explicit
+producer decommissioning requires stopping/fencing it, not guessing that retries
+have ended.
 
 ## Request/reply operations
 
 | Operation | Result |
 |---|---|
-| `put(batch_id, batch)` | Transactional rows + receipt; repeated identical ID returns receipt |
-| `peek(limit, max_bytes)` | Read pending rows without reserving them |
-| `claim(limit, lease_seconds, max_bytes)` | Reserve oldest unassigned rows for an existing ingest consumer |
-| `claim_delivery(limit, lease_seconds, max_bytes)` | Persist/lease one single-table delivery with a stable UUIDv4 |
+| `put(batch_id, batch, producer_id, sequence, digest, retired_through=0)` | Commit new rows or acknowledge a matching/retired retry |
+| `retire(producer_id, retired_through)` | Persist monotonic retirement; delete covered source records |
+| `peek(limit, max_bytes)` | Inspect pending rows without reserving |
+| `claim(limit, lease_seconds, max_bytes)` | Legacy lease of unassigned rows |
+| `claim_delivery(limit, lease_seconds, max_bytes)` | Persist/lease one single-table group with stable UUIDv4 |
 | `renew(lease_id, lease_seconds)` | Extend a live lease |
-| `ack(lease_id, ids?)` | Mark all/specified members sent after backend confirmation |
-| `release(lease_id)` | Return unconfirmed members to pending |
-| `stats()` | Pending/inflight/sent, bytes, receipts, losses and counters |
+| `ack(lease_id, ids?)` | Confirm backend delivery, delete confirmed payload and completed delivery metadata atomically |
+| `release(lease_id)` | Return unconfirmed members to pending and remove the temporary lease |
+| `stats()` | Live/physical bytes, producer/source counts, pending/inflight and cumulative counters |
 
-Correlated version-1 JSON requests use ZeroMQ REQ/REP. A timed-out request needs
-a fresh request socket; the local Client handles that. Claims return
-`buffer.batch.v1` with lease/token/expiry and rows containing ID, table, payload
-and creation time. Defaults are 50 rows, 60-second leases and 8 MiB; limits are
-1000 rows, 16 MiB and one-hour leases. Expired leases become pending, including
-after restart. Late ACKs cannot complete newly claimed rows. Partial and repeated
-ACKs are supported within retained metadata.
+Version-1 envelopes still use correlated ZeroMQ REQ/REP. Row builder reuses its
+successful request socket; a timeout discards it before retrying. The changed put contract
+requires coordinated row-builder/buffer deployment. Claims keep the existing
+`buffer.delivery.v1` shape. Defaults remain 50 rows, 60-second leases and 8 MiB;
+limits are 1000 rows, 16 MiB and one-hour leases. Expired leases become pending
+across restarts. Late ACKs cannot complete newly claimed rows.
 
-Rows and stable batch receipts commit together; same ID/different content is
-rejected. Receipts remain at least seven days by default and while rows remain.
-Deduplication after receipt/row retention expires is not guaranteed. This local
-protocol does not provide backend exactly-once delivery.
+## Backend delivery and bounded replay bookkeeping
 
-## Persistent HTTP delivery identity
+Buffer still regroups rows by destination table and persists each delivery UUID
+and exact row membership before returning it to ingest. Release, lease expiry
+and restart preserve that UUID, order and payload. Uncertain retries are never
+repackaged under a new UUID. Ingest is unchanged and sends it as backend
+`batch_id`; the receipt-aware backend remains the durable duplicate authority.
 
-`claim_delivery` is an opt-in RPC operation for future ingest/backend integration.
-It returns `buffer.delivery.v1` with `delivery_id` (UUIDv4), `table`, `lease_id`,
-`expires_at` and the existing row envelopes. Empty replies have null IDs/table
-and an empty row list. UUID and row membership commit in SQLite before reply.
+Backend-confirmed rows and their completed delivery records are deleted
+transactionally. A completed lease token permits lost-ACK response replay until
+its original expiry, with at most 1024 completed tokens retained. Beyond that
+bounded replay window ingest's existing `invalid_lease` recovery applies; a late
+ACK can be reported ambiguous even if rows were already confirmed, but it cannot
+delete a different lease's rows. Active/pending deliveries are never purged merely
+for age or capacity. Legacy partial ACKs remain supported for legacy claims;
+stable HTTP deliveries require a full ACK.
 
-An additive schema-v2 migration creates `deliveries` with `delivery_id` (primary
-key), `table_name`, `row_ids` (ordered JSON IDs), `state`, `created_at` and
-`completed_at`. Existing rows, producer receipts and leases are preserved.
-Version-1 buffer code cannot open a version-2 database; retain a pre-upgrade
-backup if a code rollback is needed.
+## Capacity and limits
 
-Released/expired deliveries retain their UUID, order, table and exact payloads
-across restarts. A retry uses a new temporary lease but the same delivery UUID.
-Existing pending deliveries are retried before preparing new unassigned work;
-live leases are skipped. Lower retry limits return `too_large` rather than split
-an existing delivery. Retrying consumers must retain compatible row/byte limits.
+`pending` includes leased unsent rows; `inflight` is its leased subset. No capacity
+path deletes pending or inflight rows. `dropped_pending_total` remains observable
+and should stay zero for this schema. A full buffer rejects new intake atomically,
+so journaled batches remain with row builder for retry.
 
-Use `renew`/`release` with the lease token and `ack` only after backend success.
-Saved deliveries require a full ACK; it marks their rows sent and the delivery
-completed in one transaction. Repeated ACKs are safe within retained lease
-metadata. Pending delivery members cannot be taken by legacy `claim` or evicted
-under capacity pressure. `peek` still shows released pending rows. Completed
-delivery metadata is retained for `receipt_days`; pending metadata never expires.
-`pending_deliveries` is included in stats, health snapshots and published status.
+Admission uses occupied SQLite pages, excluding reusable free pages, rather than
+rejecting just because a previously large file has not shrunk. Intake stops at
+85% projected live usage and rolls back a batch that would exceed 90%, preserving
+headroom for claims, confirmations and retirement. SQLite `max_page_count`
+separately caps the main database at the configured whole-page size.
+`live_bytes` and `main_bytes` expose those values. `size_mb`/`disk_bytes` include
+database + WAL + SHM; transient WAL/SHM can exceed the main-page limit. This is
+**not a hard filesystem quota**. WAL autocheckpoint is 128 pages, retained WAL
+target is 1 MiB, and maintenance reuses/reclaims free space. Lowering the
+configured page ceiling below an existing main file fails explicitly; it does
+not silently use a larger SQLite page ceiling.
 
-Updated ingest uses `claim_delivery` and sends `delivery_id` as the backend
-`batch_id`. Deploy the receipt-aware backend first, then this buffer, then ingest.
-The backend must atomically store its receipt and destination rows and echo the
-UUID with the confirmed row count. HTTP retries reuse the saved delivery, never
-repackage uncertain rows under a new UUID. Legacy `claim` remains available for
-older clients but provides no backend delivery identity.
+Finite storage cannot absorb unlimited outages or intake above delivery capacity.
+Backend latency, source payload size and durable commit time determine the actual
+rate; one million rows per second is not guaranteed. If buffer fills, the bounded
+producer journal can also fill, and upstream live queues can still drop input
+before it is journaled. That earlier loss boundary is unchanged by this patch.
 
-## Capacity and pending meaning
+## Development reset / compatibility
 
-`pending` is all unsent work, including leased rows; `inflight` is the leased
-subset. Sent retention uses `delete_after_hours`; zero removes sent rows promptly.
-Cleanup accounts for DB/WAL/shared-memory files, checkpoints and reclaims pages.
-Under pressure it removes sent rows before oldest pending rows, exposing
-`dropped_pending_total`. Active leases, pending deliveries and unexpired receipts are protected; new
-writes can be rejected for retry if protected data fills capacity.
+Schema version is now **3**. Version-1/2 buffer files and nonempty legacy producer
+journals fail closed with an explicit-reset/migration error. No automatic deletion
+or lossy migration runs. For a development rollout, stop the owners and choose
+fresh buffer **and producer journal** paths/volumes together; preserve the old
+pair if recovery matters. Do not point a progressed journal at an empty buffer,
+or reset a buffer's checkpoints while keeping its old journal. This patch neither
+deletes existing local/Jetson data nor deploys changes.
 
-`max_size_mb` is an operational target, not a hard filesystem quota. A single batch
-must fit within half the configured capacity. Earlier pipeline losses before
-producer journaling remain outside this durable boundary.
+## Recorded local checks
+
+Before removal of the temporary test directory, 17 isolated regression checks
+passed: duplicates/conflicts, durable checkpoints, lost acknowledgments, restart,
+stable backend grouping, capacity rejection without eviction, resume after drain,
+bounded bookkeeping and journal limits. Benchmark measurements and their limits
+are retained in [buffer handoff](../../docs/BUFFER_HANDOFF.md). Test/benchmark
+scripts were removed at the user's request; no test runner is included.
 
 ## Endpoints and inspection
 

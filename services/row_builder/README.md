@@ -51,7 +51,8 @@ The PUB on container 5562 / host 12000 is observational. Generated deployments
 also configure `--buffer-connect` for acknowledged delivery. Every nonempty batch
 is committed synchronously to a separate SQLite producer journal, using WAL and
 `synchronous=FULL`, before diagnostic publishing. A background delivery thread
-retries the stable batch ID until buffer confirms its own durable commit, then
+retries the journaled UUIDv4, producer sequence and SHA-256 until buffer confirms
+its own durable commit, then
 removes the journal entry. Backend HTTP delivery happens later in ingest; the
 builder does not wait for that response.
 Volume `delivery_row_builder` mounts at `/delivery`, with `/delivery/pending.db`.
@@ -60,8 +61,22 @@ Row builder never opens buffer's own database.
 The journal is bounded by graph row limits (currently 1000 batches / 4 MiB).
 When full, row building blocks without discarding already journaled batches.
 Earlier live input queues can still overflow. Restart preserves pending journal
-entries. Empty batches are visible but not journaled or stored. Buffer receipt
-retention defines how long retry deduplication is guaranteed.
+entries. Empty batches are visible but not journaled or stored.
+
+A persistent producer UUID and monotonic journal sequence fence retries. Deleting
+an acknowledged entry and advancing `retired_through` is one FULL-sync transaction.
+Puts piggyback that checkpoint; when idle, delivery sends an explicit retirement
+RPC and retries it after failure/restart. Buffer can then discard covered source
+UUID/hash records while its small durable producer checkpoint rejects delayed old
+messages. A zero queue count alone is not a safe retirement boundary. Backend
+delivery groups keep their separate buffer-generated UUIDs; ingest is unchanged.
+
+The new put protocol requires the matching schema-v3 buffer. Nonempty legacy
+journals require an explicit development reset/migration; no automatic deletion
+occurs. Select fresh buffer and journal storage together, never reset just one
+side of a progressed handoff. A journal rollback against newer buffer state is
+unsupported. See [buffer storage/recovery](../buffer/README.md) and
+[isolated measurements](../../docs/BUFFER_HANDOFF.md).
 
 ## Notification-based scheduling
 
