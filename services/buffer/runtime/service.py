@@ -15,6 +15,7 @@ import zmq
 from .configuration import load_settings
 from .logging import add_arguments, configure
 from ..storage.database import Database, integer
+from ..storage.maintenance import Maintenance
 from ..messaging.protocol import BufferError, decode, encode, MAX_MESSAGE_BYTES
 from ..messaging.publisher import Publisher
 
@@ -31,7 +32,15 @@ def dispatch(database, request):
     op = request.get("op")
     common = {"version", "request_id", "op"}
     fields = {
-        "put": {"batch_id", "batch"},
+        "put": {
+            "batch_id",
+            "batch",
+            "producer_id",
+            "sequence",
+            "digest",
+            "retired_through",
+        },
+        "retire": {"producer_id", "retired_through"},
         "claim": {"limit", "lease_seconds", "max_bytes"},
         "claim_delivery": {"limit", "lease_seconds", "max_bytes"},
         "peek": {"limit", "max_bytes"},
@@ -79,7 +88,7 @@ def parser():
     result.add_argument(
         "--database", type=Path, help="Override api.buffer.path for isolated testing"
     )
-    result.add_argument("--receipt-days", type=int, default=7)
+
     result.add_argument("--max-requests", type=int)
     result.add_argument(
         "--health-file",
@@ -95,14 +104,12 @@ def run(args):
     for endpoint in (args.bind, args.status_bind):
         if not endpoint.startswith(("tcp://", "ipc://")):
             raise ValueError("buffer endpoints must use TCP or IPC")
-    integer(args.receipt_days, "receipt_days", 1, 365)
     if args.max_requests is not None:
         integer(args.max_requests, "max_requests", 1, 1_000_000)
     database = Database(
         args.database or api.buffer.path,
         max_size_mb=api.buffer.max_size_mb,
         delete_after_hours=api.buffer.delete_after_hours,
-        receipt_days=args.receipt_days,
     )
     publisher = None
     stop, handlers = threading.Event(), {}
@@ -110,7 +117,9 @@ def run(args):
         for signum in (signal.SIGINT, signal.SIGTERM):
             handlers[signum] = signal.signal(signum, lambda *_: stop.set())
     requests = rejected = cycles = code = 0
-    next_maintenance = next_status = time.monotonic()
+    next_status = time.monotonic()
+    maintenance = Maintenance(database.path, api.buffer.max_size_mb, stop)
+    maintenance.start()
     previous_drops = 0
     try:
         publisher = Publisher(args.status_bind)
@@ -147,18 +156,27 @@ def run(args):
                             error = (
                                 exc.code
                                 if isinstance(exc, BufferError)
-                                else "storage"
-                                if isinstance(exc, sqlite3.Error)
-                                else "invalid"
+                                else (
+                                    "capacity"
+                                    if getattr(exc, "sqlite_errorcode", None)
+                                    == sqlite3.SQLITE_FULL
+                                    else (
+                                        "storage"
+                                        if isinstance(exc, sqlite3.Error)
+                                        else "invalid"
+                                    )
+                                )
                             )
                             reply = {
                                 "version": 1,
                                 "request_id": request.get("request_id"),
                                 "ok": False,
                                 "code": error,
-                                "error": str(exc)[:200]
-                                if isinstance(exc, BufferError)
-                                else "buffer request validation or storage failed",
+                                "error": (
+                                    str(exc)[:200]
+                                    if isinstance(exc, BufferError)
+                                    else "buffer request validation or storage failed"
+                                ),
                             }
                             log.warning(
                                 "request rejected",
@@ -171,12 +189,13 @@ def run(args):
                         socket.send(encode(reply))
                         requests += 1
                     now = time.monotonic()
-                    if now >= next_maintenance:
-                        database.maintain()
-                        cycles += 1
-                        next_maintenance = now + 5
+                    if maintenance.error is not None:
+                        raise RuntimeError(
+                            "buffer maintenance failed"
+                        ) from maintenance.error
                     if now >= next_status:
                         stats = database.stats()
+                        cycles += 1
                         status = {
                             "state": "waiting",
                             "updated_at": time.time(),
@@ -240,6 +259,8 @@ def run(args):
         log.exception("buffer failed")
         code = 1
     finally:
+        stop.set()
+        maintenance.join()
         if publisher:
             publisher.close()
         write_status(

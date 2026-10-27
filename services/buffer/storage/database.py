@@ -11,12 +11,16 @@ from ..messaging.protocol import BufferError
 from ..messaging.rows import encode as encode_rows
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS receipts (
-    batch_id TEXT PRIMARY KEY, digest TEXT NOT NULL, row_count INTEGER NOT NULL,
-    created_at REAL NOT NULL
+-- Storage: rows. Producer coordination: checkpoints + only unretired handoffs.
+CREATE TABLE IF NOT EXISTS producers (
+    producer_id TEXT PRIMARY KEY, saved_through INTEGER NOT NULL,
+    retired_through INTEGER NOT NULL
 );
--- Bound retention/expiry work by eligible records rather than all history.
-CREATE INDEX IF NOT EXISTS receipts_created_at ON receipts(created_at);
+CREATE TABLE IF NOT EXISTS source_batches (
+    batch_id TEXT PRIMARY KEY, producer_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+    digest TEXT NOT NULL, row_count INTEGER NOT NULL,
+    UNIQUE(producer_id, sequence)
+);
 CREATE TABLE IF NOT EXISTS rows (
     id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
     table_name TEXT NOT NULL, payload TEXT NOT NULL,
@@ -26,6 +30,9 @@ CREATE TABLE IF NOT EXISTS rows (
 );
 CREATE INDEX IF NOT EXISTS rows_status_id ON rows(status,id);
 CREATE INDEX IF NOT EXISTS rows_batch ON rows(batch_id);
+CREATE INDEX IF NOT EXISTS rows_pending_table ON rows(status,table_name,id);
+CREATE INDEX IF NOT EXISTS rows_lease ON rows(lease_id);
+CREATE INDEX IF NOT EXISTS rows_lease_expiry ON rows(lease_until) WHERE status='inflight';
 CREATE INDEX IF NOT EXISTS rows_status_sent_at ON rows(status,sent_at);
 CREATE TABLE IF NOT EXISTS leases (
     token TEXT PRIMARY KEY, state TEXT NOT NULL, expires_at REAL NOT NULL,
@@ -58,12 +65,15 @@ def integer(value, name, minimum=1, maximum=1000):
 
 
 class Database:
-    def __init__(self, path, *, max_size_mb=512, delete_after_hours=24, receipt_days=7):
+    def __init__(
+        self, path, *, max_size_mb=512, delete_after_hours=24, initialize=True
+    ):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.max_bytes = max_size_mb * 1024 * 1024
+        # Delivered payloads are removed after backend ACK. The old YAML retention
+        # remains accepted for configuration compatibility, not receipt history.
         self.retention = delete_after_hours * 3600
-        self.receipt_retention = receipt_days * 86400
         self.connection = sqlite3.connect(self.path, timeout=10)
         self.connection.row_factory = sqlite3.Row
         try:
@@ -71,7 +81,10 @@ class Database:
             legacy = self.connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE name='buffer'"
             ).fetchone()
-            if version not in (0, 1, 2) or legacy:
+            existing = self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='rows'"
+            ).fetchone()
+            if version not in (0, 3) or legacy or (version == 0 and existing):
                 raise ValueError(
                     "unsupported or legacy buffer database; explicit migration is required"
                 )
@@ -79,11 +92,24 @@ class Database:
             self.connection.execute("PRAGMA journal_mode=WAL")
             self.connection.execute("PRAGMA synchronous=FULL")
             self.connection.execute("PRAGMA busy_timeout=10000")
-            # Additive, transactional migration; existing rows and leases survive.
-            self.connection.executescript(
-                "BEGIN IMMEDIATE;\n" + SCHEMA + "\nPRAGMA user_version=2;\nCOMMIT;"
+            self.connection.execute("PRAGMA wal_autocheckpoint=128")
+            self.connection.execute("PRAGMA journal_size_limit=1048576")
+            # A page ceiling limits the main database, not transient WAL/SHM bytes.
+            requested_pages = int(
+                self.max_bytes
+                // self.connection.execute("PRAGMA page_size").fetchone()[0]
             )
-            self.maintain()
+            actual_pages = self.connection.execute(
+                "PRAGMA max_page_count=" + str(requested_pages)
+            ).fetchone()[0]
+            if actual_pages > requested_pages:
+                raise ValueError(
+                    "existing database exceeds configured page ceiling; explicit reclamation/reset required"
+                )
+            if initialize:
+                self.connection.executescript(
+                    "BEGIN IMMEDIATE;\n" + SCHEMA + "\nPRAGMA user_version=3;\nCOMMIT;"
+                )
         except Exception:
             self.connection.close()
             raise
@@ -101,76 +127,152 @@ class Database:
             (now,),
         )
         self.connection.execute(
-            "UPDATE leases SET state='expired' WHERE state='active' AND expires_at<=?",
-            (now,),
+            "DELETE FROM leases WHERE state='active' AND expires_at<=?", (now,)
         )
 
-    def put(self, batch_id, batch):
-        if not isinstance(batch_id, str) or not 1 <= len(batch_id) <= 128:
-            raise BufferError("invalid", "invalid batch ID")
+    @staticmethod
+    def _producer_id(value):
+        try:
+            parsed = uuid.UUID(value)
+            if str(parsed) != value or parsed.version != 4:
+                raise ValueError()
+        except (ValueError, TypeError, AttributeError):
+            raise BufferError("invalid", "expected canonical producer UUIDv4")
+
+    def _retire(self, producer_id, retired_through):
+        self._producer_id(producer_id)
+        integer(retired_through, "retired_through", 0, 2**63 - 1)
+        self.connection.execute(
+            "INSERT OR IGNORE INTO producers VALUES (?,0,0)", (producer_id,)
+        )
+        producer = self.connection.execute(
+            "SELECT * FROM producers WHERE producer_id=?", (producer_id,)
+        ).fetchone()
+        if retired_through > producer["saved_through"]:
+            raise BufferError("conflict", "cannot retire batches not durably saved")
+        if retired_through > producer["retired_through"]:
+            self.connection.execute(
+                "UPDATE producers SET retired_through=? WHERE producer_id=?",
+                (retired_through, producer_id),
+            )
+            self.connection.execute(
+                "DELETE FROM source_batches WHERE producer_id=? AND sequence<=?",
+                (producer_id, retired_through),
+            )
+        return max(retired_through, producer["retired_through"])
+
+    def retire(self, producer_id, retired_through):
+        with self.connection:
+            value = self._retire(producer_id, retired_through)
+        return {"retired_through": value}
+
+    def put(self, batch_id, batch, producer_id, sequence, digest, retired_through=0):
+        self._producer_id(batch_id)
+        integer(sequence, "sequence", 1, 2**63 - 1)
         encode_rows(batch)
-        if not batch["rows"]:
-            return {"batch_id": batch_id, "stored": 0, "duplicate": False}
         payload = json.dumps(
             batch["rows"], sort_keys=True, separators=(",", ":"), allow_nan=False
         )
+        actual = hashlib.sha256(payload.encode()).hexdigest()
+        if actual != digest:
+            raise BufferError("conflict", "payload hash does not match rows")
         if len(payload.encode()) > self.max_bytes // 2:
             raise BufferError(
-                "too_large",
-                "batch exceeds half the configured buffer capacity; split it or increase capacity",
+                "too_large", "batch exceeds half the configured buffer capacity"
             )
-        digest = hashlib.sha256(payload.encode()).hexdigest()
-        with self.connection:
-            previous = self.connection.execute(
-                "SELECT digest,row_count FROM receipts WHERE batch_id=?", (batch_id,)
-            ).fetchone()
-            if previous:
-                if previous["digest"] != digest:
-                    raise BufferError(
-                        "conflict", "batch ID was already committed with different rows"
-                    )
-                self._count("duplicates_total")
-                return {
-                    "batch_id": batch_id,
-                    "stored": previous["row_count"],
-                    "duplicate": True,
-                }
-            # If only live metadata/leased rows fill capacity, stop admitting more.
-            page_size = self.connection.execute("PRAGMA page_size").fetchone()[0]
-            live_pages = (
-                self.connection.execute("PRAGMA page_count").fetchone()[0]
-                - self.connection.execute("PRAGMA freelist_count").fetchone()[0]
-            )
-            evictable = self.connection.execute(
-                "SELECT 1 FROM rows WHERE status='sent' OR "
-                f"(status='pending' AND {UNASSIGNED}) LIMIT 1"
-            ).fetchone()
-            if live_pages * page_size >= self.max_bytes and not evictable:
-                raise BufferError(
-                    "capacity",
-                    "buffer metadata or leased rows fill capacity; retry after cleanup",
+        try:
+            with self.connection:
+                # Reserve the write lock before reading coordination state.
+                self.connection.execute(
+                    "UPDATE counters SET value=value WHERE name='batches_total'"
                 )
-            now = time.time()
-            self.connection.execute(
-                "INSERT INTO receipts VALUES (?,?,?,?)",
-                (batch_id, digest, len(batch["rows"]), now),
-            )
-            self.connection.executemany(
-                "INSERT INTO rows(batch_id,ordinal,table_name,payload,status,created_at) VALUES (?,?,?,?,'pending',?)",
-                [
-                    (
-                        batch_id,
-                        index,
-                        item["table"],
-                        json.dumps(item["row"], separators=(",", ":"), allow_nan=False),
-                        now,
+                retired = self._retire(producer_id, retired_through)
+                if sequence <= retired:
+                    return {
+                        "batch_id": batch_id,
+                        "stored": len(batch["rows"]),
+                        "duplicate": True,
+                        "retired": True,
+                    }
+                previous = self.connection.execute(
+                    "SELECT * FROM source_batches WHERE batch_id=? OR (producer_id=? AND sequence=?)",
+                    (batch_id, producer_id, sequence),
+                ).fetchone()
+                if previous:
+                    if (
+                        previous["batch_id"],
+                        previous["producer_id"],
+                        previous["sequence"],
+                        previous["digest"],
+                        previous["row_count"],
+                    ) != (batch_id, producer_id, sequence, digest, len(batch["rows"])):
+                        raise BufferError(
+                            "conflict",
+                            "batch identity was reused with different content",
+                        )
+                    self._count("duplicates_total")
+                    return {
+                        "batch_id": batch_id,
+                        "stored": previous["row_count"],
+                        "duplicate": True,
+                    }
+                saved = self.connection.execute(
+                    "SELECT saved_through FROM producers WHERE producer_id=?",
+                    (producer_id,),
+                ).fetchone()[0]
+                if sequence != saved + 1:
+                    raise BufferError(
+                        "conflict", "producer sequence must be contiguous"
                     )
-                    for index, item in enumerate(batch["rows"])
-                ],
-            )
-            self._count("batches_total")
-            self._count("received_rows_total", len(batch["rows"]))
-        # Confirm immediately after durable commit; scheduled cleanup is separate.
+                # Reserve headroom for claims/ACKs/checkpoints to drain a full buffer.
+                page_size = self.connection.execute("PRAGMA page_size").fetchone()[0]
+                live = (
+                    self.connection.execute("PRAGMA page_count").fetchone()[0]
+                    - self.connection.execute("PRAGMA freelist_count").fetchone()[0]
+                ) * page_size
+                if live + len(payload.encode()) >= self.max_bytes * 0.85:
+                    raise BufferError(
+                        "capacity", "live buffer capacity reached; retry after delivery"
+                    )
+                self.connection.execute(
+                    "INSERT INTO source_batches VALUES (?,?,?,?,?)",
+                    (batch_id, producer_id, sequence, digest, len(batch["rows"])),
+                )
+                now = time.time()
+                self.connection.executemany(
+                    "INSERT INTO rows(batch_id,ordinal,table_name,payload,status,created_at) "
+                    "VALUES (?,?,?,?,'pending',?)",
+                    (
+                        (
+                            batch_id,
+                            index,
+                            item["table"],
+                            json.dumps(
+                                item["row"], separators=(",", ":"), allow_nan=False
+                            ),
+                            now,
+                        )
+                        for index, item in enumerate(batch["rows"])
+                    ),
+                )
+                self.connection.execute(
+                    "UPDATE producers SET saved_through=? WHERE producer_id=?",
+                    (sequence, producer_id),
+                )
+                self._count("batches_total")
+                self._count("received_rows_total", len(batch["rows"]))
+                live = (
+                    self.connection.execute("PRAGMA page_count").fetchone()[0]
+                    - self.connection.execute("PRAGMA freelist_count").fetchone()[0]
+                ) * page_size
+                if live > self.max_bytes * 0.90:
+                    raise BufferError(
+                        "capacity", "batch would consume delivery recovery headroom"
+                    )
+        except sqlite3.OperationalError as exc:
+            if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_FULL:
+                raise BufferError("capacity", "SQLite page capacity reached") from exc
+            raise
         return {"batch_id": batch_id, "stored": len(batch["rows"]), "duplicate": False}
 
     def _select(self, limit, max_bytes, *, table_name=None, unassigned=True):
@@ -366,8 +468,8 @@ class Database:
                     )
                 completed.append(delivery["delivery_id"])
             self.connection.executemany(
-                "UPDATE rows SET status='sent',sent_at=? WHERE id=? AND status='inflight' AND lease_id=?",
-                [(time.time(), identity, lease_id) for identity in fresh],
+                "DELETE FROM rows WHERE id=? AND status='inflight' AND lease_id=?",
+                [(identity, lease_id) for identity in fresh],
             )
             acknowledged |= fresh
             self.connection.execute(
@@ -383,6 +485,15 @@ class Database:
                 [(time.time(), identity) for identity in completed],
             )
             self._count("sent_rows_total", len(fresh))
+            self._count("purged_sent_total", len(fresh))
+            # ACK response replay is a bounded cache, never seven days of history.
+            self.connection.execute(
+                "DELETE FROM leases WHERE token IN (SELECT token FROM leases "
+                "WHERE state='acked' ORDER BY created_at DESC LIMIT -1 OFFSET 1024)"
+            )
+            self.connection.executemany(
+                "DELETE FROM deliveries WHERE delivery_id=?", [(i,) for i in completed]
+            )
         # The service schedules cleanup after replying, not in this ACK path.
         return {"acked": len(requested), "duplicate": False}
 
@@ -422,7 +533,7 @@ class Database:
                 (lease_id,),
             )
             self.connection.execute(
-                "UPDATE leases SET state='released' WHERE token=? AND state='active'",
+                "DELETE FROM leases WHERE token=? AND state='active'",
                 (lease_id,),
             )
             return {"released": result.rowcount}
@@ -438,59 +549,26 @@ class Database:
             if path.exists()
         )
 
-    def _reclaim(self):
-        self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        # One bounded operation avoids a separate FULL-sync transaction per page.
-        self.connection.execute("PRAGMA incremental_vacuum(1024)").fetchall()
-        self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-
     def maintain(self):
+        """Bounded maintenance; never discard pending/inflight rows or source fences."""
         now = time.time()
         with self.connection:
             self._expire()
-            deleted = self.connection.execute(
-                "DELETE FROM rows WHERE status='sent' AND sent_at<=?",
-                (now - self.retention,),
-            ).rowcount
-            self._count("purged_sent_total", deleted)
+            # Completed ACK replay tokens live only until the original lease expires.
+            # Limit each pass so cleanup cannot become one unbounded write.
             self.connection.execute(
-                "DELETE FROM receipts WHERE created_at<? AND NOT EXISTS (SELECT 1 FROM rows WHERE rows.batch_id=receipts.batch_id)",
-                (now - self.receipt_retention,),
+                "DELETE FROM leases WHERE token IN (SELECT token FROM leases "
+                "WHERE state!='active' AND expires_at<=? ORDER BY created_at LIMIT 256)",
+                (now,),
             )
             self.connection.execute(
-                "DELETE FROM leases WHERE state!='active' AND created_at<?",
-                (now - self.receipt_retention,),
+                "DELETE FROM deliveries WHERE delivery_id IN (SELECT delivery_id FROM deliveries "
+                "WHERE state='completed' ORDER BY completed_at LIMIT 256)"
             )
-            self.connection.execute(
-                "DELETE FROM deliveries WHERE state='completed' AND completed_at<?",
-                (now - self.receipt_retention,),
-            )
-        if self.disk_bytes() <= self.max_bytes:
-            return
-        self._reclaim()
-        while self.disk_bytes() > self.max_bytes:
-            selected = self.connection.execute(
-                "SELECT id,status FROM rows WHERE status='sent' ORDER BY id LIMIT 1000"
-            ).fetchall()
-            if not selected:
-                selected = self.connection.execute(
-                    f"SELECT id,status FROM rows WHERE status='pending' AND {UNASSIGNED} ORDER BY id LIMIT 1000"
-                ).fetchall()
-            if not selected:
-                break  # Leases and retained dedup receipts cannot be discarded safely.
-            with self.connection:
-                self.connection.executemany(
-                    "DELETE FROM rows WHERE id=?", [(row["id"],) for row in selected]
-                )
-                self._count(
-                    "dropped_pending_total",
-                    sum(row["status"] == "pending" for row in selected),
-                )
-                self._count(
-                    "purged_sent_total",
-                    sum(row["status"] == "sent" for row in selected),
-                )
-            self._reclaim()
+        # WAL readers keep serving during cleanup; checkpoint never waits for readers.
+        self.connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        # Free pages remain reusable even if physical high-water size has not shrunk.
+        self.connection.execute("PRAGMA incremental_vacuum(64)").fetchall()
 
     def stats(self):
         with self.connection:
@@ -508,13 +586,27 @@ class Database:
             "sent": counts.get("sent", 0),
             "size_mb": round(disk / 1024 / 1024, 3),
             "disk_bytes": disk,
+            "main_bytes": self.path.stat().st_size,
+            "wal_bytes": (
+                Path(str(self.path) + "-wal").stat().st_size
+                if Path(str(self.path) + "-wal").exists()
+                else 0
+            ),
             "max_size_mb": self.max_bytes / 1024 / 1024,
+            "live_bytes": (
+                self.connection.execute("PRAGMA page_count").fetchone()[0]
+                - self.connection.execute("PRAGMA freelist_count").fetchone()[0]
+            )
+            * self.connection.execute("PRAGMA page_size").fetchone()[0],
+            "producers": self.connection.execute(
+                "SELECT COUNT(*) FROM producers"
+            ).fetchone()[0],
             "over_limit": disk > self.max_bytes,
             "pending_deliveries": self.connection.execute(
                 "SELECT COUNT(*) FROM deliveries WHERE state='pending'"
             ).fetchone()[0],
-            "receipts": self.connection.execute(
-                "SELECT COUNT(*) FROM receipts"
+            "source_batches": self.connection.execute(
+                "SELECT COUNT(*) FROM source_batches"
             ).fetchone()[0],
             **{
                 key: counters.get(key, 0)
