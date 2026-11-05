@@ -5,6 +5,8 @@ import json
 import logging
 import math
 import os
+import queue
+import threading
 import re
 import sys
 
@@ -143,16 +145,63 @@ def add_arguments(parser):
     )
 
 
+class AsyncHandler(logging.Handler):
+    """Bounded logging: slow stderr never holds the frame publisher."""
+
+    def __init__(self, formatter, stream, capacity=256):
+        super().__init__()
+        self.setFormatter(formatter)
+        self.stream = stream
+        self.records = queue.Queue(capacity)
+        self.dropped = 0
+        self.stopping = threading.Event()
+        self.writer = threading.Thread(
+            target=self._write, name="camera-log-writer", daemon=True
+        )
+        self.writer.start()
+
+    def emit(self, record):
+        try:
+            self.records.put_nowait(record)
+        except queue.Full:
+            self.dropped += 1
+
+    def _write(self):
+        while not self.stopping.is_set() or not self.records.empty():
+            try:
+                record = self.records.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self.stream.write(self.format(record) + "\n")
+                self.stream.flush()
+            except Exception:
+                # Reporting a failed log write through logging would recurse.
+                self.dropped += 1
+
+    def close(self):
+        self.stopping.set()
+        if threading.current_thread() is not self.writer:
+            self.writer.join(timeout=0.2)
+        super().close()
+
+
+def logging_dropped_total():
+    return sum(
+        getattr(handler, "dropped", 0) for handler in logging.getLogger().handlers
+    )
+
+
 def configure(args, service, instance, **context):
     stream = sys.stderr
     color = args.log_color == "always" or (
         args.log_color == "auto" and stream.isatty() and "NO_COLOR" not in os.environ
     )
-    handler = logging.StreamHandler(stream)
-    handler.setFormatter(
+    handler = AsyncHandler(
         Formatter(
             service, instance, output=args.log_format, color=color, context=context
-        )
+        ),
+        stream,
     )
     logging.basicConfig(level=args.log_level, handlers=[handler], force=True)
 

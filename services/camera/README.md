@@ -27,7 +27,8 @@
 
 `CameraSource` owns OpenCV open/read/reconnect/close. `CameraWorker` drives it on
 one capture thread and hands frames to a bounded buffer. The runtime thread
-publishes queued frames and handles status, signals and native-operation timeout.
+publishes queued frames and handles signals and native-operation timeout; a
+separate worker persists health and emits periodic status.
 Source recovery is independent of inference and other downstream work.
 
 Only `cameras.yaml` selects the enabled camera. USB sources are integers, RTSP
@@ -120,3 +121,24 @@ use camera `entrance`, model `people` and device `node-01`. Host ports can chang
 with generated instance order; the umbrella endpoint maps are authoritative.
 
 [Update only this image](../../docs/UPDATES.md) · [Inspect connections](../../docs/OBSERVABILITY.md) · [Storage and recovery](../../docs/STORAGE.md)
+
+## Publication and telemetry isolation
+
+Capture and frame publishing retain their existing queue limits and pacing.
+The publishing loop hands status to a one-slot latest-only health worker; camera
+logs use a bounded 256-record asynchronous writer. Slow telemetry I/O does not block
+the publishing loop; replaced snapshots and discarded log records increment
+`telemetry_dropped_total`. Shutdown waits are bounded; a stuck health writer is
+reported through the existing stuck-thread exit path.
+
+Existing status records add `sampled_at` (snapshot Unix seconds, preserved even
+when telemetry is delayed), `sample_elapsed_ms`, `publish_loop_gap_ms_max`,
+`frame_queue_age_ms_max`, `publish_duration_ms_max` (encoding plus send),
+`health_write_duration_ms_max`, `frames_dropped_overflow_total` and
+`frames_dropped_expired_total`. Timing maxima cover the sampled publisher interval;
+health-write time in logs covers the current write, while the persisted health
+snapshot contains the previous write duration (a write cannot measure itself).
+Queue age is measured when a frame is removed for publication; it excludes discarded
+frames. The existing total also includes oversized and cleared frames, so the two
+new reason counters need not sum to that total. PUB success remains unacknowledged.
+No per-frame INFO records are added.

@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import queue
 from pathlib import Path
 import signal
 import threading
@@ -14,7 +15,7 @@ import zmq
 
 from config.controller.parsers.strict import ConfigError
 from .configuration import load_camera
-from .logging import add_arguments, configure
+from .logging import add_arguments, configure, logging_dropped_total
 from ..messaging.publisher import Publisher
 from ..capture.source import CameraSource
 from ..capture.worker import CameraWorker, FrameBuffer
@@ -120,6 +121,92 @@ def write_status(path: Path, status: dict):
             pass
 
 
+class Telemetry(threading.Thread):
+    """Latest-only status persistence; never execute disk I/O on the frame loop."""
+
+    def __init__(self, path):
+        super().__init__(name="camera-health-writer", daemon=True)
+        self.path = path
+        self.pending = queue.Queue(1)
+        self.stopping = threading.Event()
+        self.dropped = 0
+
+    def submit(self, status):
+        try:
+            self.pending.put_nowait(status)
+        except queue.Full:
+            try:
+                self.pending.get_nowait()
+                self.dropped += 1
+            except queue.Empty:
+                pass
+            self.pending.put_nowait(status)
+
+    def run(self):
+        last_write_ms = 0.0
+        while not self.stopping.is_set() or not self.pending.empty():
+            try:
+                status = self.pending.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            final = status.pop("final", False)
+            status["telemetry_dropped_total"] = self.dropped + logging_dropped_total()
+            status["health_write_duration_ms_max"] = last_write_ms
+            if self.path:
+                started = time.perf_counter()
+                write_status(self.path, status)
+                last_write_ms = (time.perf_counter() - started) * 1000
+            status["health_write_duration_ms_max"] = last_write_ms
+            if not final:
+                log_status(status)
+
+
+def log_status(status):
+    log.info(
+        "capture status",
+        extra={
+            "stage": "input",
+            "event": "capture_status",
+            "fields": {
+                "state": status["state"],
+                "captured_total": status["captured"],
+                "fps": status["capture_fps"],
+                "reconnects_total": status["reconnects"],
+                "sample_elapsed_ms": status["sample_elapsed_ms"],
+                "sampled_at": status["updated_at"],
+            },
+        },
+    )
+    log.info(
+        "publisher status",
+        extra={
+            "stage": "output",
+            "event": "publisher_status",
+            "fields": {
+                "sent_total": status["published"],
+                "sampled_at": status["updated_at"],
+                "fps": status["publish_fps"],
+                "queued_frames": status["queued"],
+                "queued_bytes": status["queued_bytes"],
+                "dropped_total": status["dropped_local"],
+                **{
+                    key: status[key]
+                    for key in (
+                        "sample_elapsed_ms",
+                        "publish_loop_gap_ms_max",
+                        "frame_queue_age_ms_max",
+                        "publish_duration_ms_max",
+                        "health_write_duration_ms_max",
+                        "frames_dropped_overflow_total",
+                        "frames_dropped_expired_total",
+                        "telemetry_dropped_total",
+                    )
+                },
+            },
+        },
+    )
+
+
 def run(args) -> tuple[int, bool]:
     """Return exit code and whether a stuck native thread requires immediate exit."""
     camera = load_camera(args.config, args.camera_id, args.pipeline)
@@ -141,12 +228,32 @@ def run(args) -> tuple[int, bool]:
             old_handlers[signum] = signal.signal(signum, on_stop)
     log.info("camera %s: frames output bound to %s", camera.id, publisher.endpoint)
     worker.start()
+    telemetry = Telemetry(args.health_file)
+    telemetry.start()
+    last_loop = time.perf_counter()
+    metrics = dict.fromkeys(
+        (
+            "publish_loop_gap_ms_max",
+            "frame_queue_age_ms_max",
+            "publish_duration_ms_max",
+        ),
+        0.0,
+    )
     next_status = 0
     previous_status_time = time.monotonic()
     previous_captured = previous_published = 0
     code = 0
     try:
         while not stop.is_set():
+            if not telemetry.is_alive():
+                log.error("camera telemetry worker stopped unexpectedly")
+                code = 1
+                break
+            now = time.perf_counter()
+            metrics["publish_loop_gap_ms_max"] = max(
+                metrics["publish_loop_gap_ms_max"], (now - last_loop) * 1000
+            )
+            last_loop = now
             snapshot = worker.snapshot()
             if (
                 snapshot["state"] in ("opening", "reading", "closing")
@@ -160,7 +267,16 @@ def run(args) -> tuple[int, bool]:
                 break
             frame = buffer.get()
             if frame is not None:
+                started = time.perf_counter()
+                metrics["frame_queue_age_ms_max"] = max(
+                    metrics["frame_queue_age_ms_max"],
+                    (time.monotonic() - frame.queued_at) * 1000,
+                )
                 publisher.publish(frame)
+                metrics["publish_duration_ms_max"] = max(
+                    metrics["publish_duration_ms_max"],
+                    (time.perf_counter() - started) * 1000,
+                )
                 log.debug(
                     "frame sent",
                     extra={
@@ -193,35 +309,9 @@ def run(args) -> tuple[int, bool]:
                     publisher.sent,
                 )
                 previous_status_time = time.monotonic()
-                log.info(
-                    "capture status",
-                    extra={
-                        "stage": "input",
-                        "event": "capture_status",
-                        "fields": {
-                            "state": status["state"],
-                            "captured_total": status["captured"],
-                            "fps": status["capture_fps"],
-                            "reconnects_total": status["reconnects"],
-                        },
-                    },
-                )
-                log.info(
-                    "publisher status",
-                    extra={
-                        "stage": "output",
-                        "event": "publisher_status",
-                        "fields": {
-                            "sent_total": status["published"],
-                            "fps": status["publish_fps"],
-                            "queued_frames": status["queued"],
-                            "queued_bytes": status["queued_bytes"],
-                            "dropped_total": status["dropped_local"],
-                        },
-                    },
-                )
-                if args.health_file:
-                    write_status(args.health_file, status)
+                status.update(metrics, sample_elapsed_ms=elapsed * 1000)
+                metrics = dict.fromkeys(metrics, 0.0)
+                telemetry.submit(status)
                 next_status = time.monotonic() + 5
             if args.max_frames and publisher.sent >= args.max_frames:
                 break
@@ -234,17 +324,18 @@ def run(args) -> tuple[int, bool]:
         publisher.close()
         for signum, handler in old_handlers.items():
             signal.signal(signum, handler)
-        if args.health_file:
-            write_status(
-                args.health_file,
-                {
-                    **worker.snapshot(),
-                    **buffer.snapshot(),
-                    "published": publisher.sent,
-                    "state": "failed" if code or worker.is_alive() else "stopped",
-                    "updated_at": time.time(),
-                },
-            )
+        telemetry.submit(
+            {
+                **worker.snapshot(),
+                **buffer.snapshot(),
+                "published": publisher.sent,
+                "state": "failed" if code or worker.is_alive() else "stopped",
+                "updated_at": time.time(),
+                "final": True,
+            }
+        )
+        telemetry.stopping.set()
+        telemetry.join(args.shutdown_timeout)
         log.info(
             "camera %s: stopped; captured=%s published=%s dropped_local=%s",
             camera.id,
@@ -252,7 +343,7 @@ def run(args) -> tuple[int, bool]:
             publisher.sent,
             buffer.snapshot()["dropped_local"],
         )
-    return code, worker.is_alive()
+    return code, worker.is_alive() or telemetry.is_alive()
 
 
 def main():
@@ -272,8 +363,7 @@ def main():
         )
         return 1
     if stuck:
-        log.error("capture thread did not stop; exiting for supervisor recovery")
-        logging.shutdown()
+        log.error("camera worker did not stop; exiting for supervisor recovery")
         os._exit(1)
     return code
 

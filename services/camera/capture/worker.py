@@ -30,6 +30,8 @@ class FrameBuffer:
         self._bytes = 0
         self._condition = threading.Condition()
         self.dropped = 0
+        self.dropped_overflow = 0
+        self.dropped_expired = 0
 
     def _remove(self):
         frame = self._items.popleft()
@@ -44,6 +46,7 @@ class FrameBuffer:
         ):
             self._remove()
             self.dropped += 1
+            self.dropped_expired += 1
 
     def put(self, frame: Frame, stop: threading.Event) -> bool:
         with self._condition:
@@ -62,6 +65,7 @@ class FrameBuffer:
                         and time.monotonic() - frame.queued_at > self.max_age
                     ):
                         self.dropped += 1
+                        self.dropped_expired += 1
                         return False
                     self._items.append(frame)
                     self._bytes += frame.image.nbytes
@@ -69,10 +73,12 @@ class FrameBuffer:
                     return True
                 if self.overflow == "drop_newest":
                     self.dropped += 1
+                    self.dropped_overflow += 1
                     return False
                 if self.overflow == "drop_oldest":
                     self._remove()
                     self.dropped += 1
+                    self.dropped_overflow += 1
                 else:
                     self._condition.wait(0.1)
             return False
@@ -100,6 +106,8 @@ class FrameBuffer:
                 "queued": len(self._items),
                 "queued_bytes": self._bytes,
                 "dropped_local": self.dropped,
+                "frames_dropped_overflow_total": self.dropped_overflow,
+                "frames_dropped_expired_total": self.dropped_expired,
             }
 
 
