@@ -131,3 +131,20 @@ use camera `entrance`, model `people` and device `node-01`. Host ports can chang
 with generated instance order; the umbrella endpoint maps are authoritative.
 
 [Update only this image](../../docs/UPDATES.md) · [Inspect connections](../../docs/OBSERVABILITY.md) · [Storage and recovery](../../docs/STORAGE.md)
+
+## Interval diagnostics
+
+Processing, scheduling and output behavior are unchanged. Existing model status
+records and health snapshots add per-camera interval `sample_elapsed_ms`, `frames`
+(completed frames), `detections` (object count), `detections_per_frame_mean`,
+`detections_per_frame_max`, `queue_wait_ms_max`, `prediction_duration_ms_max`,
+`annotation_duration_ms_max`, `publish_duration_ms_max` and `worker_duration_ms_max`.
+These fixed-size accumulators reset when the supervisor samples them. Zero completed
+frames yields zero metrics, not proof of zero in-progress latency. Queue wait starts
+at inbox arrival; publication includes encoding and both enabled output sends.
+Worker duration excludes queue wait and includes prediction/result conversion,
+batch construction, annotation and publication; the existing `infer_ms` remains the
+last model-call measurement. A disabled annotation output has zero annotation time.
+No per-frame INFO records, histograms or frame histories are retained. Model metrics
+have their own sampling boundary and must not be treated as frame-aligned with
+adjacent services or the separately sampled lifetime counters.

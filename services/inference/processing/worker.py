@@ -124,6 +124,41 @@ class InferenceWorker(threading.Thread):
         self.error = None
         self.annotated_sent = dict.fromkeys(inputs, 0)
         self.last_inference_ms = dict.fromkeys(inputs, 0.0)
+        self.metrics = {key: self._empty_metrics() for key in inputs}
+        self.metrics_since = time.monotonic()
+
+    @staticmethod
+    def _empty_metrics():
+        return dict.fromkeys(
+            (
+                "frames",
+                "detections",
+                "detections_per_frame_max",
+                "queue_wait_ms_max",
+                "prediction_duration_ms_max",
+                "annotation_duration_ms_max",
+                "publish_duration_ms_max",
+                "worker_duration_ms_max",
+            ),
+            0,
+        )
+
+    def take_metrics(self):
+        with self.lock:
+            now = time.monotonic()
+            result = {
+                key: {
+                    **values,
+                    "sample_elapsed_ms": (now - self.metrics_since) * 1000,
+                    "detections_per_frame_mean": values["detections"] / values["frames"]
+                    if values["frames"]
+                    else 0,
+                }
+                for key, values in self.metrics.items()
+            }
+            self.metrics = {key: self._empty_metrics() for key in self.inputs}
+            self.metrics_since = now
+            return result
 
     def _state(self, state):
         with self.lock:
@@ -155,12 +190,15 @@ class InferenceWorker(threading.Thread):
                 item = self.inbox.get(self.stop)
                 if item is None:
                     break
-                header, image, _ = item
+                header, image, arrived = item
+                queue_wait_ms = (time.monotonic() - arrived) * 1000
+                started = time.perf_counter()
                 key = header["camera_id"]
                 self._state("inferring")
                 detections, elapsed = self.model.infer(
                     image, self.inputs[key].camera.classes
                 )
+                predicted = time.perf_counter()
                 log.debug(
                     "prediction complete",
                     extra={
@@ -194,6 +232,7 @@ class InferenceWorker(threading.Thread):
                     inference_ms=elapsed,
                     detections=detections,
                 )
+                annotation_started = time.perf_counter()
                 annotated = None
                 if self.annotated_bind:
                     annotated = Frame(
@@ -210,8 +249,32 @@ class InferenceWorker(threading.Thread):
                             "detection_count": len(detections),
                         },
                     )
+                annotation_finished = time.perf_counter()
                 publisher.publish(batch, annotated)
+                finished = time.perf_counter()
                 with self.lock:
+                    metrics = self.metrics[key]
+                    metrics["frames"] += 1
+                    metrics["detections"] += len(detections)
+                    metrics["detections_per_frame_max"] = max(
+                        metrics["detections_per_frame_max"], len(detections)
+                    )
+                    for field, value in (
+                        ("queue_wait_ms_max", queue_wait_ms),
+                        ("prediction_duration_ms_max", (predicted - started) * 1000),
+                        (
+                            "annotation_duration_ms_max",
+                            (annotation_finished - annotation_started) * 1000
+                            if annotated is not None
+                            else 0,
+                        ),
+                        (
+                            "publish_duration_ms_max",
+                            (finished - annotation_finished) * 1000,
+                        ),
+                        ("worker_duration_ms_max", (finished - started) * 1000),
+                    ):
+                        metrics[field] = max(metrics[field], value)
                     self.status["processed"] += 1
                     self.status["processed_at_ns"] = batch["processed_at_ns"]
                     self.per_camera[key] += 1

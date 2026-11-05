@@ -119,6 +119,7 @@ def log_status(status, previous, elapsed):
                     "processed_total": processed,
                     "fps": round((processed - before.get("processed", 0)) / elapsed, 2),
                     "last_inference_ms": status["last_inference_ms"][camera_id],
+                    **status.get("interval_metrics", {}).get(camera_id, {}),
                 },
             },
         )
@@ -194,6 +195,7 @@ def run(args, *, model=None):
             if time.monotonic() >= next_status:
                 status["inputs"] = inbox.snapshot()
                 now = time.monotonic()
+                status["interval_metrics"] = worker.take_metrics()
                 log_status(status, previous, max(now - previous_status_time, 0.001))
                 previous_status_time = now
                 write_status(args.health_file, status)
