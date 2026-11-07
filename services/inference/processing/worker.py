@@ -6,7 +6,7 @@ import threading
 import time
 
 from services.inference.messaging.frames import Frame
-from ..messaging.publisher import Publisher
+from ..messaging.publisher import AnnotatedPublisher, Publisher
 from .annotator import annotate
 
 log = logging.getLogger(__name__)
@@ -88,6 +88,168 @@ class FrameInbox:
             }
 
 
+class AnnotationWorker(threading.Thread):
+    """Best-effort previews: one latest pending job per camera, plus one in flight."""
+
+    def __init__(self, inputs, endpoint):
+        super().__init__(name="inference-annotation", daemon=True)
+        self.endpoint = endpoint
+        self.condition = threading.Condition()
+        self.order = deque(inputs)
+        self.pending = {}
+        self.stopping = False
+        self.error = None
+        self.state, self.since = "created", time.monotonic()
+        self.inflight = None
+        self.counters = {
+            key: dict(sent_total=0, skipped_total=0, failed_total=0, cancelled_total=0)
+            for key in inputs
+        }
+        self.metrics = {key: self._empty_metrics() for key in inputs}
+        self.metrics_since = time.monotonic()
+
+    @staticmethod
+    def _empty_metrics():
+        return dict.fromkeys(
+            (
+                "annotation_frames",
+                "annotation_queue_wait_ms_max",
+                "annotation_duration_ms_max",
+                "annotated_publish_duration_ms_max",
+            ),
+            0,
+        )
+
+    def submit(self, batch, image):
+        key = batch["camera_id"]
+        with self.condition:
+            if self.stopping or self.error:
+                self.counters[key]["skipped_total"] += 1
+                return
+            if key in self.pending:
+                self.counters[key]["skipped_total"] += 1
+            self.pending[key] = batch, image, time.monotonic()
+            self.condition.notify()
+
+    def request_stop(self):
+        with self.condition:
+            self.stopping = True
+            for key in self.pending:
+                self.counters[key]["cancelled_total"] += 1
+            self.pending.clear()
+            self.condition.notify_all()
+
+    def snapshot(self):
+        with self.condition:
+            return {
+                "enabled": True,
+                "state": self.state,
+                "since": self.since,
+                "error": self.error,
+                "alive": self.is_alive(),
+                "inflight_camera": self.inflight,
+                "per_camera": {
+                    key: {**counts, "queued": int(key in self.pending)}
+                    for key, counts in self.counters.items()
+                },
+            }
+
+    def take_metrics(self):
+        with self.condition:
+            now = time.monotonic()
+            result = {
+                key: {
+                    **values,
+                    "annotation_enabled": True,
+                    "annotation_sample_elapsed_ms": (now - self.metrics_since) * 1000,
+                    "annotation_queued_frames": int(key in self.pending),
+                    **{
+                        "annotation_" + name: count
+                        for name, count in self.counters[key].items()
+                    },
+                }
+                for key, values in self.metrics.items()
+            }
+            self.metrics = {key: self._empty_metrics() for key in self.counters}
+            self.metrics_since = now
+            return result
+
+    def run(self):
+        publisher = None
+        try:
+            # The preview thread owns its socket/context from creation to close.
+            publisher = AnnotatedPublisher(self.endpoint)
+            while True:
+                with self.condition:
+                    self.state, self.since = "waiting", time.monotonic()
+                    while not self.pending and not self.stopping:
+                        self.condition.wait()
+                    if self.stopping:
+                        break
+                    for _ in range(len(self.order)):
+                        key = self.order[0]
+                        self.order.rotate(-1)
+                        if key in self.pending:
+                            batch, image, arrived = self.pending.pop(key)
+                            break
+                    self.inflight = key
+                    self.state, self.since = "annotating", time.monotonic()
+                queue_wait_ms = (time.monotonic() - arrived) * 1000
+                started = time.perf_counter()
+                frame = Frame(
+                    key,
+                    batch["stream_id"],
+                    batch["sequence"],
+                    batch["received_at_ns"],
+                    annotate(image, batch["detections"]),
+                    time.monotonic(),
+                    {
+                        "stage": "inference",
+                        "model_id": batch["model_id"],
+                        "model_version": batch["model_version"],
+                        "detection_count": len(batch["detections"]),
+                    },
+                )
+                annotated = time.perf_counter()
+                publisher.publish(frame)
+                finished = time.perf_counter()
+                with self.condition:
+                    self.counters[key]["sent_total"] += 1
+                    metrics = self.metrics[key]
+                    metrics["annotation_frames"] += 1
+                    for field, value in (
+                        ("annotation_queue_wait_ms_max", queue_wait_ms),
+                        ("annotation_duration_ms_max", (annotated - started) * 1000),
+                        (
+                            "annotated_publish_duration_ms_max",
+                            (finished - annotated) * 1000,
+                        ),
+                    ):
+                        metrics[field] = max(metrics[field], value)
+                    self.inflight = None
+        except Exception as exc:
+            with self.condition:
+                self.error = type(exc).__name__
+                if self.inflight is not None:
+                    self.counters[self.inflight]["failed_total"] += 1
+            log.error(
+                "annotated output failed (%s); detection processing continues",
+                self.error,
+            )
+        finally:
+            self.request_stop()
+            try:
+                if publisher is not None:
+                    publisher.close()
+            except Exception as exc:
+                self.error = type(exc).__name__
+                log.error("annotated output cleanup failed (%s)", self.error)
+            with self.condition:
+                self.inflight = None
+                self.state = "failed" if self.error else "stopped"
+                self.since = time.monotonic()
+
+
 class InferenceWorker(threading.Thread):
     def __init__(
         self, model, inputs, inbox, stop, *, bind, annotated_bind=None, max_frames=None
@@ -108,7 +270,9 @@ class InferenceWorker(threading.Thread):
         }
         self.per_camera = dict.fromkeys(inputs, 0)
         self.error = None
-        self.annotated_sent = dict.fromkeys(inputs, 0)
+        self.annotation_worker = (
+            AnnotationWorker(inputs, annotated_bind) if annotated_bind else None
+        )
         self.last_inference_ms = dict.fromkeys(inputs, 0.0)
         self.metrics = {key: self._empty_metrics() for key in inputs}
         self.metrics_since = time.monotonic()
@@ -122,7 +286,6 @@ class InferenceWorker(threading.Thread):
                 "detections_per_frame_max",
                 "queue_wait_ms_max",
                 "prediction_duration_ms_max",
-                "annotation_duration_ms_max",
                 "publish_duration_ms_max",
                 "worker_duration_ms_max",
             ),
@@ -145,7 +308,10 @@ class InferenceWorker(threading.Thread):
             }
             self.metrics = {key: self._empty_metrics() for key in self.inputs}
             self.metrics_since = now
-            return result
+        if self.annotation_worker is not None:
+            for key, values in self.annotation_worker.take_metrics().items():
+                result[key].update(values)
+        return result
 
     def _state(self, state):
         with self.lock:
@@ -153,20 +319,42 @@ class InferenceWorker(threading.Thread):
 
     def snapshot(self):
         with self.lock:
-            return {
+            result = {
                 **self.status,
                 "per_camera": dict(self.per_camera),
                 "model_id": self.model.config.id,
-                "annotated_sent": dict(self.annotated_sent),
                 "last_inference_ms": dict(self.last_inference_ms),
             }
+        annotation = (
+            self.annotation_worker.snapshot()
+            if self.annotation_worker
+            else {"enabled": False, "state": "disabled", "per_camera": {}}
+        )
+        result["annotation"] = annotation
+        result["annotated_sent"] = {
+            key: annotation["per_camera"].get(key, {}).get("sent_total", 0)
+            for key in self.inputs
+        }
+        return result
+
+    def join_annotation(self, timeout):
+        if (
+            self.annotation_worker is not None
+            and self.annotation_worker.ident is not None
+        ):
+            self.annotation_worker.join(timeout)
+
+    def annotation_alive(self):
+        return self.annotation_worker is not None and self.annotation_worker.is_alive()
 
     def run(self):
         publisher = None
         try:
             self._state("loading")
             self.model.load()
-            publisher = Publisher(self.bind, self.annotated_bind)
+            publisher = Publisher(self.bind)
+            if self.annotation_worker is not None:
+                self.annotation_worker.start()
             log.info(
                 "model %s loaded once; serving %s cameras without FPS pacing",
                 self.model.config.id,
@@ -224,25 +412,11 @@ class InferenceWorker(threading.Thread):
                     inference_ms=elapsed,
                     detections=detections,
                 )
-                annotation_started = time.perf_counter()
-                annotated = None
-                if self.annotated_bind:
-                    annotated = Frame(
-                        key,
-                        header["stream_id"],
-                        header["sequence"],
-                        header["received_at_ns"],
-                        annotate(image, detections),
-                        time.monotonic(),
-                        {
-                            "stage": "inference",
-                            "model_id": self.model.config.id,
-                            "model_version": self.model.config.version,
-                            "detection_count": len(detections),
-                        },
-                    )
-                annotation_finished = time.perf_counter()
-                publisher.publish(batch, annotated)
+                publish_started = time.perf_counter()
+                publisher.publish(batch)
+                published = time.perf_counter()
+                if self.annotation_worker is not None:
+                    self.annotation_worker.submit(batch, image)
                 finished = time.perf_counter()
                 with self.lock:
                     metrics = self.metrics[key]
@@ -255,14 +429,8 @@ class InferenceWorker(threading.Thread):
                         ("queue_wait_ms_max", queue_wait_ms),
                         ("prediction_duration_ms_max", (predicted - started) * 1000),
                         (
-                            "annotation_duration_ms_max",
-                            (annotation_finished - annotation_started) * 1000
-                            if annotated is not None
-                            else 0,
-                        ),
-                        (
                             "publish_duration_ms_max",
-                            (finished - annotation_finished) * 1000,
+                            (published - publish_started) * 1000,
                         ),
                         ("worker_duration_ms_max", (finished - started) * 1000),
                     ):
@@ -271,8 +439,6 @@ class InferenceWorker(threading.Thread):
                     self.status["processed_at_ns"] = batch["processed_at_ns"]
                     self.per_camera[key] += 1
                     self.last_inference_ms[key] = elapsed
-                    if annotated is not None:
-                        self.annotated_sent[key] += 1
                     count = self.status["processed"]
                 if self.max_frames and count >= self.max_frames:
                     break
@@ -281,6 +447,8 @@ class InferenceWorker(threading.Thread):
             log.error("inference failed (%s): %s", self.error, str(exc)[:300])
         finally:
             self._state("closing")
+            if self.annotation_worker is not None:
+                self.annotation_worker.request_stop()
             try:
                 if publisher:
                     publisher.close()

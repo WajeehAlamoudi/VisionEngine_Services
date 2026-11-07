@@ -29,8 +29,9 @@ checks, follow the [GPU deployment guide](../../docs/GPU_DEPLOYMENT.md).
 ## Model ownership
 
 One process loads one Ultralytics detection model and calls `predict()`, never
-`track()`. A receiver thread handles cameras; one worker schedules their model
-work fairly. Tracking is separate. `models.yaml` supplies assets, thresholds,
+`track()`. A receiver thread handles cameras; one worker schedules prediction and
+detection publication fairly. A separate optional worker draws and publishes
+preview frames using its own ZeroMQ socket/context. Tracking is separate. `models.yaml` supplies assets, thresholds,
 classes, input size and device; `cameras.yaml` supplies assignments and classes.
 The camera service owns the YAML `fps_target` output limit; inference has no
 independent FPS cap.
@@ -59,8 +60,13 @@ Missing assets or unknown model classes fail explicitly. No automatic weight dow
 
 Boxes are source pixel `[x1,y1,x2,y2]`. Camera/stream/sequence, capture timestamp
 and dimensions correlate pixels with detections. Empty results still publish.
-Annotation draws on a copy and adds stage/model/count metadata to the three-part
-frame message. Detection JSON uses topic + JSON. The outputs are independent;
+Annotation draws on a copy in the preview worker and adds stage/model/count
+metadata to the three-part frame message. Detection JSON uses topic + JSON.
+One latest pending preview job per camera plus one job in flight bounds memory;
+superseded previews are skipped without discarding detection output. Preview
+failure or slow publication does not make the model worker wait. Original frame
+identities/timestamps are preserved, but not every detection has a preview.
+The outputs are independent;
 raw ZeroMQ frames are not a browser RTSP/WebRTC feed.
 
 ## Run and inspect
@@ -106,8 +112,10 @@ shape/precision. [Ultralytics prediction API](https://docs.ultralytics.com/modes
 
 Per-camera defaults: two frames, 16 MiB, 500 ms local age, drop oldest. Worker
 selection is round-robin and takes available frames immediately, without FPS
-pacing. The worker detects, optionally annotates and publishes each admitted frame.
-Combined compute still limits output FPS; queue growth cannot create capacity. Wire frames support up to
+pacing. The model worker detects and publishes detections for each admitted frame,
+then queues optional preview work without waiting for drawing or preview sends.
+Combined model/CPU/GPU capacity still limits throughput; threads do not provide
+hardware isolation or guarantee processing every incoming frame. Wire frames support up to
 64 MiB; queue bytes can be smaller. Unsupported graph policies fail generation.
 
 Logs expose received/processed counts, drops, timings and FPS per camera. Startup
@@ -117,6 +125,11 @@ queue/expiry/validation safeguards, not intentional FPS pacing; processing every
 received frame is not guaranteed under overload or best-effort transport. Fresh
 status/recent completed work is aggregate health, not proof every camera is online.
 Default native load/predict timeout is 120 seconds; watchdog exit permits recovery.
+Detection health is independent of optional preview health: the `annotation`
+snapshot reports its state/error, in-flight camera and per-camera queue/send/skip/
+failure/cancellation counts. A preview failure is logged and leaves detection
+running. Shutdown joins both workers with the configured bounded timeout; a stuck
+preview thread follows the existing supervisor recovery path on shutdown.
 PUB/SUB has no ACK/replay and no automatic replica work distribution.
 
 ## Source map
@@ -141,16 +154,25 @@ with generated instance order; the umbrella endpoint maps are authoritative.
 
 ## Interval diagnostics
 
-Model status records and health snapshots include per-camera interval `sample_elapsed_ms`, `frames`
-(completed frames), `detections` (object count), `detections_per_frame_mean`,
-`detections_per_frame_max`, `queue_wait_ms_max`, `prediction_duration_ms_max`,
-`annotation_duration_ms_max`, `publish_duration_ms_max` and `worker_duration_ms_max`.
-These fixed-size accumulators reset when the supervisor samples them. Zero completed
-frames yields zero metrics, not proof of zero in-progress latency. Queue wait starts
-at inbox arrival; publication includes encoding and both enabled output sends.
-Worker duration excludes queue wait and includes prediction/result conversion,
-batch construction, annotation and publication; the existing `infer_ms` remains the
-last model-call measurement. A disabled annotation output has zero annotation time.
-No per-frame INFO records, histograms or frame histories are retained. Model metrics
-have their own sampling boundary and must not be treated as frame-aligned with
-adjacent services or the separately sampled lifetime counters.
+Model status and health intervals include `sample_elapsed_ms`, `frames`, `detections`,
+`detections_per_frame_mean/max`, `queue_wait_ms_max`, `prediction_duration_ms_max`,
+`publish_duration_ms_max` and `worker_duration_ms_max`. Publication timing now covers
+detection encoding/send only. Worker duration includes prediction/result conversion,
+batch construction, detection publication and enqueueing optional preview work;
+it excludes waiting, annotation and preview serialization/send. `infer_ms` remains
+the last model-call measurement.
+
+When preview output is enabled, its independently sampled interval adds
+`annotation_sample_elapsed_ms`, `annotation_frames`, `annotation_queue_wait_ms_max`,
+`annotation_duration_ms_max`, `annotated_publish_duration_ms_max`,
+`annotation_queued_frames` and cumulative `annotation_sent_total`,
+`annotation_skipped_total`, `annotation_failed_total`, `annotation_cancelled_total`.
+`annotated_sent_total` in publisher status counts actual preview send completions,
+not queued jobs or subscriber acknowledgments. Skipped/cancelled previews do not
+mean detections or accepted rows were lost. Preview failure details also appear in
+the `annotation` health snapshot. These preview metrics are absent when disabled.
+
+Fixed-size timing accumulators reset at sampling; zero completions do not rule out
+in-progress latency. No per-frame INFO records, histograms or image histories are
+retained. Preview/model/counter sampling boundaries are asynchronous and must not
+be treated as aligned frame handoffs.

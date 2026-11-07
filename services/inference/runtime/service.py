@@ -204,6 +204,7 @@ def run(args, *, model=None):
         stop.set()
         subscriber.join(args.shutdown_timeout)
         worker.join(args.shutdown_timeout)
+        worker.join_annotation(args.shutdown_timeout)
         for signum, handler in handlers.items():
             signal.signal(signum, handler)
         write_status(
@@ -217,7 +218,7 @@ def run(args, *, model=None):
         )
     return code or int(
         bool(worker.error or subscriber.error)
-    ), worker.is_alive() or subscriber.is_alive()
+    ), worker.is_alive() or subscriber.is_alive() or worker.annotation_alive()
 
 
 def main():

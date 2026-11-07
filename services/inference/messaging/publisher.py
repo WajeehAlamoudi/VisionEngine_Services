@@ -1,7 +1,7 @@
-"""Publish detections and optionally annotated frames, each on its own endpoint."""
+"""Thread-confined publishers for independent detection and preview outputs."""
 
-import zmq
 import logging
+import zmq
 
 from services.inference.messaging.detections import encode as encode_detections
 from services.inference.messaging.frames import encode as encode_frame
@@ -9,37 +9,34 @@ from services.inference.messaging.frames import encode as encode_frame
 log = logging.getLogger(__name__)
 
 
-class Publisher:
-    def __init__(self, endpoint, annotated_endpoint=None, high_water_mark=2):
+class _SocketPublisher:
+    """Create, use and close this instance on the same owning thread."""
+
+    def __init__(self, endpoint, high_water_mark=2):
         self.context = zmq.Context()
-        self.sockets = []
+        self.socket = None
         try:
-            self.detections = self._bind(endpoint, high_water_mark)
-            self.annotated = (
-                self._bind(annotated_endpoint, high_water_mark)
-                if annotated_endpoint
-                else None
-            )
+            self.socket = self.context.socket(zmq.PUB)
+            if not endpoint.startswith(("tcp://", "ipc://")):
+                raise ValueError("output endpoint must use TCP or IPC")
+            self.socket.setsockopt(zmq.SNDHWM, high_water_mark)
+            self.socket.setsockopt(zmq.LINGER, 0)
+            self.socket.bind(endpoint)
         except BaseException:
             self.close()
             raise
 
-    def _bind(self, endpoint, high_water_mark):
-        if not endpoint.startswith(("tcp://", "ipc://")):
-            raise ValueError("output endpoint must use TCP or IPC")
-        socket = self.context.socket(zmq.PUB)
-        self.sockets.append(socket)
-        socket.setsockopt(zmq.SNDHWM, high_water_mark)
-        socket.setsockopt(zmq.LINGER, 0)
-        socket.bind(endpoint)
-        return socket
+    def close(self):
+        if self.socket is not None:
+            self.socket.close(linger=0)
+        self.context.term()
 
-    def publish(self, batch, annotated_frame=None):
-        self.detections.send_multipart(encode_detections(batch))
-        if annotated_frame is not None and self.annotated is not None:
-            self.annotated.send_multipart(encode_frame(annotated_frame))
+
+class Publisher(_SocketPublisher):
+    def publish(self, batch):
+        self.socket.send_multipart(encode_detections(batch))
         log.debug(
-            "results sent",
+            "detections sent",
             extra={
                 "stage": "output",
                 "event": "results_sent",
@@ -48,13 +45,11 @@ class Publisher:
                     "stream_id": batch["stream_id"],
                     "sequence": batch["sequence"],
                     "detections": len(batch["detections"]),
-                    "annotated": annotated_frame is not None
-                    and self.annotated is not None,
                 },
             },
         )
 
-    def close(self):
-        for socket in self.sockets:
-            socket.close(linger=0)
-        self.context.term()
+
+class AnnotatedPublisher(_SocketPublisher):
+    def publish(self, frame):
+        self.socket.send_multipart(encode_frame(frame))
