@@ -143,7 +143,9 @@ Increasing the inbox does not recover messages already dropped by PUB/SUB.
 Duplicate fencing includes input channel plus camera, so alert and event sharing
 a sequence do not suppress each other. Health payload limit is 1 MiB, event 8 MiB,
 alert 16 MiB, rows 16 MiB; queues can be smaller. Logs expose skips, drops, build
-latency and per-row-kind counts. Generated health lives on shared `/health`.
+latency and per-row-kind counts. `batches_per_second` measures processed input
+message batches, not frames or generated rows. Generated health lives on shared
+`/health`.
 
 A brief `buffer_wait` state also occurs during normal durable appends. Investigate
 sustained waits alongside input `dropped_total`, journal `pending_batches` /

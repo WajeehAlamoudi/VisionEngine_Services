@@ -103,7 +103,7 @@ def log_status(status, previous, elapsed):
             "fields": {
                 "state": status["state"],
                 "processed": status["processed"],
-                "fps": round(
+                "batches_per_second": round(
                     (status["processed"] - previous.get("processed", 0)) / elapsed, 2
                 ),
                 "build_ms": round(status["last_build_ms"], 2),
