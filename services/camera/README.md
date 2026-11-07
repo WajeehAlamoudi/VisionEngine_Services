@@ -33,8 +33,10 @@ Source recovery is independent of inference and other downstream work.
 
 Only `cameras.yaml` selects the enabled camera. USB sources are integers, RTSP
 uses URLs, and file paths resolve from the working directory. Windows paths are
-not Linux container paths. `fps_target` is an analysis target, not live capture
-throttling. No model, tracker or GPU is required.
+not Linux container paths. Each camera's `fps_target` is loaded from YAML at startup
+and paces its published output; capture keeps reading independently. Changing the
+value requires restarting the camera service, not a code change. No model, tracker
+or GPU is required.
 
 ## Output contract
 
@@ -93,7 +95,11 @@ no replay or delivery ACK. Each subscriber gets its own copy; subscribers do not
 split frames between them.
 
 INPUT logs show capture/FPS/reconnects; OUTPUT shows published/FPS/queued bytes/
-drops. Generated health snapshots use unique `/health` paths on shared storage.
+drops plus `fps_target` and cumulative `rate_limited_total`. The latter counts older
+queued frames intentionally superseded by a newer frame at a publication deadline;
+it is separate from buffer overflow/expiry and `dropped_total`. Startup logs also
+show `fps_target`. Health snapshots expose the same target and skip counter and use
+unique `/health` paths on shared storage.
 Watchdog exit allows Docker process recovery; an unhealthy flag alone does not
 restart the container. Runtime temporary files are not baked into the image.
 
@@ -124,7 +130,13 @@ with generated instance order; the umbrella endpoint maps are authoritative.
 
 ## Publication and telemetry isolation
 
-Capture and frame publishing retain their existing queue limits and pacing.
+Capture retains its existing queue limits, expiry and reconnect behavior. Only
+publication is paced by `fps_target`: at each deadline the runtime selects the
+newest queued frame, preserving original identity/timestamps. Missed deadlines do
+not cause catch-up publication bursts. A slower source is not duplicated to fill
+the target rate. File playback remains controlled by `--file-fps` before this
+output cap. Overflow/expiry can still discard frames under load.
+
 The publishing loop hands status to a one-slot latest-only health worker; camera
 logs use a bounded 256-record asynchronous writer. Slow telemetry I/O does not block
 the publishing loop; replaced snapshots and discarded log records increment

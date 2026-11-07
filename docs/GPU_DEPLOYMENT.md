@@ -423,9 +423,11 @@ schema and delivery semantics. See [storage](STORAGE.md).
 Healthy containers prove their health checks passed, not detection accuracy,
 notification receipt or backend persistence. Verify real detections, stable tracks,
 rules, output rows and successful delivery with [observability](OBSERVABILITY.md).
-The inference scheduler uses each camera's `fps_target`; a measured rate near that
-target does not by itself mean the GPU has reached its hardware limit. Queue drops
-are cumulative skipped-frame counts, not empty detections.
+Camera publication uses each camera's YAML `fps_target`; inference processes
+available frames without a separate FPS cap. A measured rate near that target does
+not by itself mean the GPU has reached its hardware limit. Camera
+`rate_limited_total` counts intentional output skips; queue drops remain separate
+overload/expiry safeguards, not empty detections.
 
 ## 9 · Regeneration, updates and reboot
 

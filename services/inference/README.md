@@ -31,7 +31,9 @@ checks, follow the [GPU deployment guide](../../docs/GPU_DEPLOYMENT.md).
 One process loads one Ultralytics detection model and calls `predict()`, never
 `track()`. A receiver thread handles cameras; one worker schedules their model
 work fairly. Tracking is separate. `models.yaml` supplies assets, thresholds,
-classes, input size and device; `cameras.yaml` supplies assignments and FPS targets.
+classes, input size and device; `cameras.yaml` supplies assignments and classes.
+The camera service owns the YAML `fps_target` output limit; inference has no
+independent FPS cap.
 Missing assets or unknown model classes fail explicitly. No automatic weight download.
 
 ## Two correlated outputs
@@ -103,11 +105,16 @@ shape/precision. [Ultralytics prediction API](https://docs.ultralytics.com/modes
 ## Load and health
 
 Per-camera defaults: two frames, 16 MiB, 500 ms local age, drop oldest. Worker
-selection is round-robin and caps each camera at `fps_target`. Combined compute
-limits output FPS; queue growth cannot create capacity. Wire frames support up to
+selection is round-robin and takes available frames immediately, without FPS
+pacing. The worker detects, optionally annotates and publishes each admitted frame.
+Combined compute still limits output FPS; queue growth cannot create capacity. Wire frames support up to
 64 MiB; queue bytes can be smaller. Unsupported graph policies fail generation.
 
-Logs expose received/processed counts, drops, timings and FPS per camera. Fresh
+Logs expose received/processed counts, drops, timings and FPS per camera. Startup
+logs state `fps_limited=False` and `fps_limit_owner=camera`; each periodic
+model status and health interval also includes `fps_limited=False`. Inference drops are
+queue/expiry/validation safeguards, not intentional FPS pacing; processing every
+received frame is not guaranteed under overload or best-effort transport. Fresh
 status/recent completed work is aggregate health, not proof every camera is online.
 Default native load/predict timeout is 120 seconds; watchdog exit permits recovery.
 PUB/SUB has no ACK/replay and no automatic replica work distribution.
@@ -134,8 +141,7 @@ with generated instance order; the umbrella endpoint maps are authoritative.
 
 ## Interval diagnostics
 
-Processing, scheduling and output behavior are unchanged. Existing model status
-records and health snapshots add per-camera interval `sample_elapsed_ms`, `frames`
+Model status records and health snapshots include per-camera interval `sample_elapsed_ms`, `frames`
 (completed frames), `detections` (object count), `detections_per_frame_mean`,
 `detections_per_frame_max`, `queue_wait_ms_max`, `prediction_duration_ms_max`,
 `annotation_duration_ms_max`, `publish_duration_ms_max` and `worker_duration_ms_max`.

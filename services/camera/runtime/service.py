@@ -85,7 +85,7 @@ def parser():
         "--file-fps",
         type=positive_number,
         default=30,
-        help="video file playback rate; live sources are not gated",
+        help="video file capture pace; publication uses cameras.yaml fps_target",
     )
     result.add_argument(
         "--native-timeout",
@@ -186,6 +186,8 @@ def log_status(status):
                 "sent_total": status["published"],
                 "sampled_at": status["updated_at"],
                 "fps": status["publish_fps"],
+                "fps_target": status["fps_target"],
+                "rate_limited_total": status["rate_limited_total"],
                 "queued_frames": status["queued"],
                 "queued_bytes": status["queued_bytes"],
                 "dropped_total": status["dropped_local"],
@@ -226,7 +228,16 @@ def run(args) -> tuple[int, bool]:
     if threading.current_thread() is threading.main_thread():
         for signum in (signal.SIGINT, signal.SIGTERM):
             old_handlers[signum] = signal.signal(signum, on_stop)
-    log.info("camera %s: frames output bound to %s", camera.id, publisher.endpoint)
+    log.info(
+        "camera %s: frames output bound to %s",
+        camera.id,
+        publisher.endpoint,
+        extra={
+            "stage": "output",
+            "event": "publisher_bound",
+            "fields": {"fps_target": camera.fps_target},
+        },
+    )
     worker.start()
     telemetry = Telemetry(args.health_file)
     telemetry.start()
@@ -242,6 +253,9 @@ def run(args) -> tuple[int, bool]:
     next_status = 0
     previous_status_time = time.monotonic()
     previous_captured = previous_published = 0
+    publish_interval = 1 / camera.fps_target
+    next_publish = 0.0
+    rate_limited_total = 0
     code = 0
     try:
         while not stop.is_set():
@@ -265,8 +279,30 @@ def run(args) -> tuple[int, bool]:
                 )
                 code = 1
                 break
-            frame = buffer.get()
+            frame = None
+            wait = next_publish - time.monotonic()
+            if wait > 0:
+                stop.wait(min(wait, 0.1))
+            else:
+                frame = buffer.get()
+                if frame is not None:
+                    # Select the newest queued frame at this publication deadline.
+                    # Capture, queue expiry and reconnect clearing stay independent.
+                    for _ in range(args.max_items - 1):
+                        newer = buffer.get(timeout=0)
+                        if newer is None:
+                            break
+                        frame = newer
+                        rate_limited_total += 1
             if frame is not None:
+                now = time.monotonic()
+                following = next_publish + publish_interval
+                # Preserve phase over small delays; do not replay missed deadlines.
+                next_publish = (
+                    following
+                    if next_publish and following > now
+                    else now + publish_interval
+                )
                 started = time.perf_counter()
                 metrics["frame_queue_age_ms_max"] = max(
                     metrics["frame_queue_age_ms_max"],
@@ -295,6 +331,8 @@ def run(args) -> tuple[int, bool]:
                     **worker.snapshot(),
                     **buffer.snapshot(),
                     "published": publisher.sent,
+                    "fps_target": camera.fps_target,
+                    "rate_limited_total": rate_limited_total,
                     "updated_at": time.time(),
                 }
                 elapsed = max(time.monotonic() - previous_status_time, 0.001)
@@ -329,6 +367,8 @@ def run(args) -> tuple[int, bool]:
                 **worker.snapshot(),
                 **buffer.snapshot(),
                 "published": publisher.sent,
+                "fps_target": camera.fps_target,
+                "rate_limited_total": rate_limited_total,
                 "state": "failed" if code or worker.is_alive() else "stopped",
                 "updated_at": time.time(),
                 "final": True,
@@ -337,11 +377,12 @@ def run(args) -> tuple[int, bool]:
         telemetry.stopping.set()
         telemetry.join(args.shutdown_timeout)
         log.info(
-            "camera %s: stopped; captured=%s published=%s dropped_local=%s",
+            "camera %s: stopped; captured=%s published=%s dropped_local=%s rate_limited=%s",
             camera.id,
             worker.snapshot()["captured"],
             publisher.sent,
             buffer.snapshot()["dropped_local"],
+            rate_limited_total,
         )
     return code, worker.is_alive() or telemetry.is_alive()
 

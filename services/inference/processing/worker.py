@@ -19,7 +19,6 @@ class FrameInbox:
         self.queues = {key: deque() for key in inputs}
         self.bytes = dict.fromkeys(inputs, 0)
         self.order = deque(inputs)
-        self.next_due = dict.fromkeys(inputs, 0.0)
         self.last_frame = {}
         self.dropped = dict.fromkeys(inputs, 0)
         self.received = dict.fromkeys(inputs, 0)
@@ -43,7 +42,6 @@ class FrameInbox:
                 self.dropped[key] += len(self.queues[key])
                 self.queues[key].clear()
                 self.bytes[key] = 0
-                self.next_due[key] = 0
             self.last_frame[key] = identity
             if image.nbytes > self.max_bytes:
                 self.dropped[key] += 1
@@ -62,7 +60,6 @@ class FrameInbox:
         with self.condition:
             while not stop.is_set():
                 now = time.monotonic()
-                wait = 0.02
                 for _ in range(len(self.order)):
                     key = self.order[0]
                     self.order.rotate(-1)
@@ -73,20 +70,9 @@ class FrameInbox:
                     ):
                         self._remove(key)
                         self.dropped[key] += 1
-                    if self.queues[key] and now >= self.next_due[key]:
-                        interval = 1 / self.inputs[key].camera.fps_target
-                        # Preserve the scheduling phase across small wake-up delays.
-                        # After a full missed interval, resume without catch-up bursts.
-                        following = self.next_due[key] + interval
-                        self.next_due[key] = (
-                            following
-                            if self.next_due[key] and following > now
-                            else now + interval
-                        )
-                        return self._remove(key)
                     if self.queues[key]:
-                        wait = min(wait, max(0, self.next_due[key] - now))
-                self.condition.wait(wait)
+                        return self._remove(key)
+                self.condition.wait(0.02)
         return None
 
     def snapshot(self):
@@ -149,6 +135,7 @@ class InferenceWorker(threading.Thread):
             result = {
                 key: {
                     **values,
+                    "fps_limited": False,
                     "sample_elapsed_ms": (now - self.metrics_since) * 1000,
                     "detections_per_frame_mean": values["detections"] / values["frames"]
                     if values["frames"]
@@ -181,9 +168,14 @@ class InferenceWorker(threading.Thread):
             self.model.load()
             publisher = Publisher(self.bind, self.annotated_bind)
             log.info(
-                "model %s loaded once; serving %s cameras",
+                "model %s loaded once; serving %s cameras without FPS pacing",
                 self.model.config.id,
                 len(self.inputs),
+                extra={
+                    "stage": "processing",
+                    "event": "model_loaded",
+                    "fields": {"fps_limited": False, "fps_limit_owner": "camera"},
+                },
             )
             while not self.stop.is_set():
                 self._state("waiting")
