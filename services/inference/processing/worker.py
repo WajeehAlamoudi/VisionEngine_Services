@@ -298,7 +298,6 @@ class InferenceWorker(threading.Thread):
             result = {
                 key: {
                     **values,
-                    "fps_limited": False,
                     "sample_elapsed_ms": (now - self.metrics_since) * 1000,
                     "detections_per_frame_mean": values["detections"] / values["frames"]
                     if values["frames"]
@@ -356,13 +355,12 @@ class InferenceWorker(threading.Thread):
             if self.annotation_worker is not None:
                 self.annotation_worker.start()
             log.info(
-                "model %s loaded once; serving %s cameras without FPS pacing",
+                "model %s loaded; serving %s cameras",
                 self.model.config.id,
                 len(self.inputs),
                 extra={
                     "stage": "processing",
                     "event": "model_loaded",
-                    "fields": {"fps_limited": False, "fps_limit_owner": "camera"},
                 },
             )
             while not self.stop.is_set():

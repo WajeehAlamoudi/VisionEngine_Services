@@ -118,9 +118,7 @@ Combined model/CPU/GPU capacity still limits throughput; threads do not provide
 hardware isolation or guarantee processing every incoming frame. Wire frames support up to
 64 MiB; queue bytes can be smaller. Unsupported graph policies fail generation.
 
-Logs expose received/processed counts, drops, timings and FPS per camera. Startup
-logs state `fps_limited=False` and `fps_limit_owner=camera`; each periodic
-model status and health interval also includes `fps_limited=False`. Inference drops are
+Logs expose received/processed counts, drops, timings and FPS per camera. Inference drops are
 queue/expiry/validation safeguards, not intentional FPS pacing; processing every
 received frame is not guaranteed under overload or best-effort transport. Fresh
 status/recent completed work is aggregate health, not proof every camera is online.
