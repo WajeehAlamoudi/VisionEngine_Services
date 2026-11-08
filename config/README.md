@@ -152,6 +152,14 @@ config/.generated/
 └── collector.compose.yaml
 ```
 
+Generated inference commands currently omit `--annotated-bind`; its two entries
+in [controller/deployment.py](controller/deployment.py) are commented out. This
+disables the entire annotation worker while retaining detection publication.
+To restore previews, uncomment both entries, regenerate Compose and recreate the
+affected inference container. Existing containers do not change until recreated.
+The retained preview port mapping/endpoint metadata does not enable annotation.
+See [inference inspection and preview instructions](../services/inference/README.md#run-and-inspect).
+
 Only active deployed service types are included. The umbrella contains:
 
 | Section | Meaning |

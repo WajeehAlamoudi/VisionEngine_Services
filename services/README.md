@@ -13,7 +13,7 @@
 | Service | Input → output | Scope | Runtime stack |
 |---|---|---|---|
 | [Camera](camera/README.md) | Source → original frames | Camera | OpenCV / ZeroMQ |
-| [Inference](inference/README.md) | Frames → detections + annotated frames | Model | Ultralytics / Torch |
+| [Inference](inference/README.md) | Frames → detections + optional annotated frames (disabled in generated deployments) | Model | Ultralytics / Torch |
 | [Tracking](tracking/README.md) | Detections + optional pixels → tracks | Camera | BoxMOT |
 | [Enrichment](enrichment/README.md) | Detections → geometry/context events | Camera | Python / ZeroMQ |
 | [Rules](rules/README.md) | Enriched events → accepted events + alerts | Shared | Python / UTC schedules |

@@ -21,7 +21,7 @@ checks, follow the [GPU deployment guide](../../docs/GPU_DEPLOYMENT.md).
 |---|---|
 | Instance scope | One per used model |
 | Input | Selected camera frames |
-| Output | Detections + annotated frames |
+| Output | Detections + optional annotated frames (disabled in generated deployments) |
 | Image | `visionengine-inference:local` |
 | Generated file | `config/.generated/inference.compose.yaml` |
 | Entry point | `python -m services.inference` |
@@ -37,12 +37,12 @@ The camera service owns the YAML `fps_target` output limit; inference has no
 independent FPS cap.
 Missing assets or unknown model classes fail explicitly. No automatic weight download.
 
-## Two correlated outputs
+## Detection output and optional preview
 
 | Output | Container | Host start | Topic |
 |---|---|---|---|
 | Detection JSON | 5556 | 6000 | `detections.v1/<camera_id>` |
-| Annotated raw frame | 5557 | 7000 | `frame.v1/<camera_id>` |
+| Annotated raw frame (when enabled) | 5557 | 7000 | `frame.v1/<camera_id>` |
 
 ```json
 {
@@ -57,6 +57,19 @@ Missing assets or unknown model classes fail explicitly. No automatic weight dow
   ]
 }
 ```
+
+Generated Compose currently omits `--annotated-bind`: its two command entries
+are commented out in [deployment.py](../../config/controller/deployment.py).
+The annotation worker is not created or started, and no preview jobs, image
+copies/drawing, preview serialization or preview sends run. Detection and its
+JSON publisher remain enabled. Health reports `annotation.enabled: false` and
+`annotation.state: disabled`. The preview port mapping and endpoint metadata
+remain present but do not imply that a preview publisher is running.
+
+To re-enable previews for generated deployments, uncomment those two entries,
+regenerate Compose, and recreate the affected inference container. The code is
+preserved; this is a startup choice, not a live toggle or a YAML Boolean. A local
+generator edit alone does not change an existing running deployment.
 
 Boxes are source pixel `[x1,y1,x2,y2]`. Camera/stream/sequence, capture timestamp
 and dimensions correlate pixels with detections. Empty results still publish.
@@ -75,6 +88,18 @@ raw ZeroMQ frames are not a browser RTSP/WebRTC feed.
 python -m config.controller --generate
 docker compose -f config/.generated/pipeline.compose.yaml up --build -d visionengine-inference-service-people
 docker compose -f config/.generated/pipeline.compose.yaml exec visionengine-inference-service-people python -m services.inference.tools.receiver --connect tcp://127.0.0.1:5556 --camera-id entrance --count 5 --format json
+
+```
+
+The detection receiver works with annotation disabled. JSON includes each
+detection's `class_name`, `confidence` (for example, `0.91` means 91% model
+confidence), and `bbox`; an empty `detections` list is valid. Use the actual camera
+ID in your deployment. Port 5556 is inside the inference container; the first
+host mapping is 6000. These are ZeroMQ endpoints, not browser URLs.
+
+After explicitly enabling previews, this optional command can save one frame:
+
+```console
 docker compose -f config/.generated/pipeline.compose.yaml exec visionengine-inference-service-people python -m services.inference.tools.receiver --connect tcp://127.0.0.1:5557 --camera-id entrance --kind frames --count 1 --save /tmp/annotated.jpg
 ```
 
@@ -83,11 +108,12 @@ Starting this service also starts its camera dependencies. Native example:
 
 ```console
 python -m pip install -r services/inference/requirements.txt
-python -m services.inference --model-id people --input entrance=tcp://127.0.0.1:5555 --bind tcp://0.0.0.0:5556 --annotated-bind tcp://0.0.0.0:5557
+python -m services.inference --model-id people --input entrance=tcp://127.0.0.1:5555 --bind tcp://0.0.0.0:5556
 ```
 
-Repeat `--input` for other assigned cameras. Omitting `--annotated-bind` in a native
-run disables drawing/copying/annotated publication work.
+Repeat `--input` for other assigned cameras. The native example also disables
+annotation. Add `--annotated-bind tcp://0.0.0.0:5557` to enable its worker and
+preview output explicitly.
 
 ## Device and backend support
 
