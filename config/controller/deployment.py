@@ -165,8 +165,8 @@ def _inference(
         model.id,
         "--bind",
         "tcp://0.0.0.0:5556",
-        "--annotated-bind",
-        "tcp://0.0.0.0:5557",
+        # "--annotated-bind",
+        # "tcp://0.0.0.0:5557",
     ]
     dependencies, policies, seen = [], [], set()
     for edge in edges:
