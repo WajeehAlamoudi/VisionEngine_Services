@@ -21,6 +21,7 @@
 | Update one service without rebuilding the entire deployment | [Updates](UPDATES.md) |
 | Find datasets, buffer files and persistent volumes | [Storage and recovery](STORAGE.md) |
 | Follow logs, inspect outputs and diagnose missing data | [Observability](OBSERVABILITY.md) |
+| Review measured Jetson throughput and queue headroom | [Edge statistics, 18 November 2026](statistics/2026-11-18-jetson.md) |
 | Resolve startup, networking and throughput problems | [Troubleshooting](TROUBLESHOOTING.md) |
 | Add a service or configuration section | [Extension guide](EXTENDING.md) |
 
