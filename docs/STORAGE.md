@@ -79,7 +79,9 @@ Physical durability depends on storage honoring filesystem flushes.
 
 ## Buffer and producer journal
 
-Only buffer opens its SQLite database. Row builder journals each nonempty batch
+Only buffer opens its SQLite database. Row builder commits validated inputs to
+its own journal. It atomically replaces a processed input with its nonempty
+output in the send-ready table. The output is saved
 with a UUIDv4, sequence and SHA-256, then retries until buffer durably commits.
 Producer retirement checkpoints allow local source deduplication records to be
 deleted without accepting delayed old retries. One checkpoint per producer remains.

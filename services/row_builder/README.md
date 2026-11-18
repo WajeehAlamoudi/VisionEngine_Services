@@ -47,62 +47,31 @@ are valid when input is empty or mapping is disabled/skipped.
 
 ## Durable and diagnostic outputs
 
-The PUB on container 5562 / host 12000 is observational. Generated deployments
-also configure `--buffer-connect` for acknowledged delivery. Every nonempty batch
-is committed synchronously to a separate SQLite producer journal, using WAL and
-`synchronous=FULL`, before diagnostic publishing. A background delivery thread
-retries the journaled UUIDv4, producer sequence and SHA-256 until buffer confirms
-its own durable commit, then
-removes the journal entry. Backend HTTP delivery happens later in ingest; the
-builder does not wait for that response.
-Volume `delivery_row_builder` mounts at `/delivery`, with `/delivery/pending.db`.
-Row builder never opens buffer's own database.
+The generated service uses a single SQLite database at `/delivery/pending.db`
+on the `delivery_row_builder` volume. Delivery proceeds in three steps.
 
-The journal is bounded by graph row limits (currently 1000 batches / 4 MiB).
-When full, row building blocks without discarding already journaled batches.
-Earlier live input queues can still overflow. Restart preserves pending journal
-entries. Empty batches are visible but not journaled or stored.
+1. The subscriber validates each event, alert or health message and commits its
+   original JSON bytes to `incoming`. Messages ready in the same socket poll
+   share a commit. The subscriber never waits to fill a group.
+2. The worker reads inputs in receipt order and builds rows outside a database
+   transaction. One transaction inserts the exact nonempty output into `pending`,
+   records the input sequence and removes the input. A failure rolls back these
+   operations together. Empty or intentionally skipped outputs consume no buffer
+   sequence. Diagnostic PUB on container 5562 / host 12000 follows the commit.
+3. The delivery thread sends the saved output and retries with the same UUID,
+   producer sequence and digest until the buffer confirms its durable commit.
+   Deletion of the output and advancement of its retirement checkpoint are atomic.
+   Backend delivery happens later in ingest.
 
-A persistent producer UUID and monotonic journal sequence fence retries. Deleting
-an acknowledged entry and advancing `retired_through` is one FULL-sync transaction.
-Puts piggyback that checkpoint; when idle, delivery sends an explicit retirement
-RPC and retries it after failure/restart. Buffer can then discard covered source
-UUID/hash records while its small durable producer checkpoint rejects delayed old
-messages. A zero queue count alone is not a safe retirement boundary. Backend
-delivery groups keep their separate buffer-generated UUIDs; ingest is unchanged.
+The subscriber has its own SQLite connection. WAL permits simultaneous reads and
+writes. FULL synchronization covers both input and output commits. SQLite
+serializes write transactions. Row mapping and buffer RPC run outside them.
 
-The new put protocol requires the matching schema-v3 buffer. Nonempty legacy
-journals require an explicit development reset/migration; no automatic deletion
-occurs. Select fresh buffer and journal storage together, never reset just one
-side of a progressed handoff. A journal rollback against newer buffer state is
-unsupported. See [buffer storage/recovery](../buffer/README.md) and
-[isolated measurements](../../docs/BUFFER_HANDOFF.md).
-
-## Notification-based scheduling
-
-Input reception, row building and journal delivery use separate threads. Condition
-notifications wake them when work or journal space becomes available:
-
-| Waiting work | Wakeup signal | Ordering guarantee |
-|---|---|---|
-| Row builder waiting for input | Reception queues a batch in the shared inbox | Existing round-robin input scheduling and sequence fencing remain in place |
-| Delivery waiting for journal data | A nonempty batch finishes its journal commit | Delivery reads committed batches in journal order |
-| Builder waiting for journal capacity | Buffer confirms storage and journal deletion commits | Capacity is checked again before appending more work |
-
-These notifications replace the 10 ms inbox idle polling and 50 ms journal
-work/space polling. A 100 ms timed condition wait remains to check the separate
-shutdown event; newly available work or space signals the waiter immediately.
-Normal thread scheduling, locks, serialization, storage and RPC still add latency.
-The configured buffer retry backoff remains unchanged.
-
-Journal appends still run synchronously in the build loop. There is no additional
-RAM staging queue or asynchronous journal writer. Restart recovery, stable batch
-IDs and durable-before-publish behavior remain unchanged.
-
-Wakeups reduce avoidable idle delay and resume work sooner after temporary
-backpressure. They do not increase queue capacity or guarantee higher sustained
-FPS. Larger queues absorb finite bursts; sustained input above processing or
-ingest delivery capacity still accumulates work and can eventually drop live input.
+Existing journals from the current buffer protocol acquire the inbox tables on
+startup and continue draining saved outputs with their original identities.
+Preserve the journal volume and buffer database across upgrades. Before reverting
+to an older row-builder image, drain the durable inbox; older versions only read
+`pending`. [Buffer storage and recovery](../buffer/README.md)
 
 ## Run and inspect
 
@@ -126,33 +95,28 @@ is required. The direct example has no durable buffer connection unless you add 
 
 ## Queues and contracts
 
-Queue limits apply to configured input endpoints, not individually to cameras.
-For example, cameras sharing one accepted-event endpoint share its queue; alerts
-and monitor health have their own configured input queues.
+| Stage | Default limit | Behavior at the limit |
+|---|---|---|
+| ZeroMQ receive socket | 32 messages per endpoint (`--max-items`) | PUB/SUB can lose messages before input commits. |
+| Shared `incoming` inbox with buffer delivery | 100 MiB of serialized input (`--inbox-max-bytes`) | Intake waits for space. Committed inputs have no age expiry or overflow eviction. |
+| Shared send-ready `pending` journal | 1000 batches / 4 MiB (`--delivery-max-items`, `--delivery-max-bytes`) | Worker waits while delivery continues. |
+| Diagnostic-only run without `--buffer-connect` | 32 batches / 4 MiB / 5 seconds per input | Original in-memory queues use `--max-items`, `--max-bytes` and `--max-age-ms`. |
 
-| Storage | Default item limit | Default byte limit | Age / overflow behavior | CLI controls |
-|---|---|---|---|---|
-| Each input endpoint queue | 32 batches | 4 MiB | Five-second age limit; drop oldest on overflow | `--max-items`, `--max-bytes`, `--max-age-ms` |
-| Shared durable producer journal | 1000 batches | 4 MiB | No age expiry; block new appends when full | `--delivery-max-items`, `--delivery-max-bytes` |
+The 100 MiB budget measures live input payloads. Disk use also includes send-ready
+rows, SQLite pages, indexes and the WAL. Deleted pages can be reused.
+A single message larger than the configured inbox limit cannot be admitted.
 
-Both item and byte limits apply: a large batch can exhaust the byte budget before
-the item limit is reached. Input byte accounting measures serialized message size;
-decoded Python objects and separate ZeroMQ queues consume additional memory.
-Increasing the inbox does not recover messages already dropped by PUB/SUB.
+In durable mode, per-input `received_total` counts committed inputs this run.
+`queued_batches` and `queued_bytes` include unprocessed inputs from earlier runs.
+`capacity_wait` marks intake waiting for space. Input `dropped_total` counts
+application evictions only and cannot detect upstream PUB/SUB loss.
+Delivery `pending_batches` and `pending_bytes` measure send-ready outputs only.
+Compare these with acknowledgments and retries to see which stage is backing up.
 
-Duplicate fencing includes input channel plus camera, so alert and event sharing
-a sequence do not suppress each other. Health payload limit is 1 MiB, event 8 MiB,
-alert 16 MiB, rows 16 MiB; queues can be smaller. Logs expose skips, drops, build
-latency and per-row-kind counts. `batches_per_second` measures processed input
-message batches, not frames or generated rows. Generated health lives on shared
-`/health`.
-
-A brief `buffer_wait` state also occurs during normal durable appends. Investigate
-sustained waits alongside input `dropped_total`, journal `pending_batches` /
-`pending_bytes`, `acked_batches` progress and `retries`. An empty journal with a
-growing buffer backlog points to a later delivery stage; wakeups alone cannot
-resolve that backlog. Row-mapping timing does not include journal or buffer-RPC
-waiting time.
+Event and alert batches sharing a frame sequence are tracked independently.
+Health payloads are limited to 1 MiB, events to 8 MiB, alerts and rows to
+16 MiB. `batches_per_second` counts processed input batches. Row mapping
+time excludes journal and RPC waits. Health snapshots are written to `/health`.
 
 ## Source map
 
@@ -162,8 +126,8 @@ waiting time.
 | [Dockerfile](Dockerfile) | Image layers, packaged code, entry point and healthcheck |
 | [requirements.txt](requirements.txt) | Runtime dependencies |
 | `messaging/` | Service-local wire contracts, validation and input/output adapters: [alerts.py](messaging/alerts.py), [buffer.py](messaging/buffer.py), [detections.py](messaging/detections.py), [events.py](messaging/events.py), [health.py](messaging/health.py), [publisher.py](messaging/publisher.py), [rows.py](messaging/rows.py), [subscriber.py](messaging/subscriber.py) |
-| `processing/` | Row mapping, bounded input queues, notification wakeups and worker state: [builder.py](processing/builder.py), [worker.py](processing/worker.py) |
-| `runtime/` | Durable journal, notification-based delivery, configuration, lifecycle, logging and healthcheck: [configuration.py](runtime/configuration.py), [delivery.py](runtime/delivery.py), [healthcheck.py](runtime/healthcheck.py), [logging.py](runtime/logging.py), [service.py](runtime/service.py) |
+| `processing/` | Row mapping, diagnostic input queues, sequence checks and worker state: [builder.py](processing/builder.py), [worker.py](processing/worker.py) |
+| `runtime/` | Durable inbox, journal and acknowledged delivery, configuration, lifecycle, logging and healthcheck: [configuration.py](runtime/configuration.py), [inbox.py](runtime/inbox.py), [delivery.py](runtime/delivery.py), [healthcheck.py](runtime/healthcheck.py), [logging.py](runtime/logging.py), [service.py](runtime/service.py) |
 | `tools/` | Diagnostic receivers and inspection utilities: [receiver.py](tools/receiver.py) |
 
 ## Operating notes

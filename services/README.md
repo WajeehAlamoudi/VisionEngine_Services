@@ -17,7 +17,7 @@
 | [Tracking](tracking/README.md) | Detections + optional pixels → tracks | Camera | BoxMOT |
 | [Enrichment](enrichment/README.md) | Detections → geometry/context events | Camera | Python / ZeroMQ |
 | [Rules](rules/README.md) | Enriched events → accepted events + alerts | Shared | Python / UTC schedules |
-| [Row builder](row_builder/README.md) | Events / alerts / health → table rows | Shared | Python / producer SQLite journal |
+| [Row builder](row_builder/README.md) | Events / alerts / health → table rows | Shared | Python / SQLite input inbox and delivery journal |
 | [Buffer](buffer/README.md) | Durable puts → leased rows | Shared | SQLite WAL / ZeroMQ RPC |
 | [Ingest](ingest/README.md) | Leased rows → backend HTTP | Shared | Python / HTTP |
 | [Notifier](notifier/README.md) | Fired alerts → webhook / SMTP / logs | Shared | Async HTTP / aiosmtplib |

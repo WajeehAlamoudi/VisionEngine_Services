@@ -34,6 +34,7 @@ class Journal:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
         self.ready = threading.Condition(self.lock)
+        self.input_space = threading.Event()
         self.max_items, self.max_bytes = max_items, max_bytes
         self.connection = sqlite3.connect(
             self.path, check_same_thread=False, timeout=10
@@ -76,7 +77,32 @@ class Journal:
             ).fetchone()
             return {"producer_id": row[0], "retired_through": row[1]}
 
-    def append(self, batch, stop):
+    def _consume(self, record_id, cursor):
+        if cursor:
+            source, identity, stream, sequence, received_ns, retired = cursor
+            self.connection.execute(
+                "INSERT OR REPLACE INTO input_cursor VALUES (?,?,?,?,?,?)",
+                (
+                    source,
+                    identity,
+                    stream,
+                    str(sequence),
+                    str(received_ns),
+                    json.dumps(retired),
+                ),
+            )
+        deleted = self.connection.execute(
+            "DELETE FROM incoming WHERE id=?", (record_id,)
+        )
+        if deleted.rowcount != 1:
+            raise RuntimeError("durable input missing during promotion")
+
+    def complete_input(self, record_id, cursor=None):
+        with self.lock, self.connection:
+            self._consume(record_id, cursor)
+        self.input_space.set()
+
+    def append(self, batch, stop, record_id=None, cursor=None):
         encode(
             batch
         )  # Check the same bounded contract used by the inspection publisher.
@@ -96,6 +122,10 @@ class Journal:
                 if self.connection.execute(
                     "SELECT 1 FROM pending WHERE source_key=?", (source_key,)
                 ).fetchone():
+                    if record_id is not None:
+                        with self.connection:
+                            self._consume(record_id, cursor)
+                        self.input_space.set()
                     return True
                 count, total = self.connection.execute(
                     "SELECT COUNT(*),COALESCE(SUM(bytes),0) FROM pending"
@@ -106,6 +136,9 @@ class Journal:
                             "INSERT INTO pending(batch_id,payload,bytes,digest,source_key) VALUES (?,?,?,?,?)",
                             (identity, payload, size, digest, source_key),
                         )
+                        if record_id is not None:
+                            self._consume(record_id, cursor)
+                    self.input_space.set()
                     self.ready.notify_all()
                     return True
                 # ACKs notify space availability; timeout only checks shutdown.
@@ -119,12 +152,14 @@ class Journal:
                     "SELECT batch_id,payload,id,digest FROM pending ORDER BY id LIMIT 1"
                 ).fetchone()
                 if row:
-                    return row[0], json.loads(row[1]), row[2], row[3]
+                    break
                 if stop is None:
                     return None
                 # Appends notify after commit; timeout only checks shutdown.
                 self.ready.wait(0.1)
-        return None
+            else:
+                return None
+        return row[0], json.loads(row[1]), row[2], row[3]
 
     def acknowledged(self, identity):
         with self.ready:

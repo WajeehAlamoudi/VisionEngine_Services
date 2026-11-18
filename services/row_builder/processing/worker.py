@@ -1,4 +1,4 @@
-"""Fair per-camera input queues and one serial row builder."""
+"""Serial row building and in-memory scheduling for diagnostic-only runs."""
 
 from collections import deque
 import logging
@@ -86,6 +86,10 @@ class Inbox:
             self.queues[key].put(batch, size)
             self.ready.notify()
 
+    def put_ready(self, messages, stop):
+        for key, batch, payload in messages:
+            self.put(key, batch, len(payload))
+
     def reject(self, camera_id):
         self.queues[camera_id].reject()
 
@@ -97,7 +101,7 @@ class Inbox:
                     self.order.rotate(-1)
                     batch = self.queues[key].pop()
                     if batch is not None:
-                        return key, batch
+                        return None, key, batch
                 if stop is None:
                     return None
                 # Incoming work notifies immediately; timeout only checks shutdown.
@@ -159,10 +163,15 @@ class RowWorker(threading.Thread):
                 incoming = self.inbox.pop(self.stop)
                 if incoming is None:
                     continue
-                source, batch = incoming
+                record_id, source, batch = incoming
                 # Events and alerts share sequence IDs but are independent inputs.
                 identity = batch.get("camera_id", batch.get("device_id"))
                 key = source, identity
+                if self.journal is not None and key not in sessions:
+                    saved = self.inbox.cursor(source, identity)
+                    if saved:
+                        sessions[key] = saved[:3]
+                        retired[key] = deque(saved[3], maxlen=64)
                 previous = sessions.get(key)
                 old_streams = retired.setdefault(key, deque(maxlen=64))
                 new_stream = previous is None or batch["stream_id"] != previous[0]
@@ -176,6 +185,8 @@ class RowWorker(threading.Thread):
                     )
                     or (not new_stream and batch["sequence"] <= previous[1])
                 ):
+                    if self.journal is not None:
+                        self.journal.complete_input(record_id)
                     with self.lock:
                         self.status["stale_total"] += 1
                     continue
@@ -183,17 +194,24 @@ class RowWorker(threading.Thread):
                     old_streams.append(previous[0])
                 self.state("building")
                 output = self.builder.build(batch)
-                if self.journal is not None and output["rows"]:
-                    self.state("buffer_wait")
-                    if not self.journal.append(output, self.stop):
-                        break
-                    self.state("building")
-                publisher.publish(output)
-                sessions[key] = (
+                position = (
                     batch["stream_id"],
                     batch["sequence"],
                     batch["received_at_ns"],
                 )
+                if self.journal is not None:
+                    self.state("buffer_wait")
+                    cursor = (source, identity, *position, list(old_streams))
+                    if output["rows"]:
+                        if not self.journal.append(
+                            output, self.stop, record_id, cursor
+                        ):
+                            break
+                    else:
+                        self.journal.complete_input(record_id, cursor)
+                    self.state("building")
+                publisher.publish(output)
+                sessions[key] = position
                 metadata = output["row_builder"]
                 with self.lock:
                     self.status["processed"] += 1

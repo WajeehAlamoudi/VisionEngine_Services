@@ -90,16 +90,16 @@ considered together. Automatic replica load balancing is not implemented.
 |---|---|
 | Camera through rules | Live PUB/SUB, finite queues, no replay or delivery acknowledgement |
 | Rules to notifier | Live best effort; per-channel queues, no persistent retry |
-| Row-builder input | Still live; loss can happen before a row is journaled |
+| Row-builder input | Live PUB/SUB up to the validated input commit. Committed batches survive in the SQLite inbox until processed. |
 | Row-builder journal to buffer | Persisted batch IDs and acknowledged transactional retry; bounded receipt retention |
 | Buffer to ingest | Leased claims, renewal, release and acknowledged completion |
 | Ingest to backend | At-least-once HTTP semantics; uncertain responses/crashes can duplicate inserts |
 | Collector files | Journaled recoverable saves; filesystem/hardware durability still matters |
 
 An observed publisher counter is a local send count, not proof of downstream
-receipt. A full durable producer journal blocks row building; upstream live queues
-can still overflow. Buffer capacity handling can drop old pending rows and exposes
-that loss. [Persistence details](STORAGE.md)
+receipt. A full send-ready journal blocks row building. The subscriber continues
+until the input inbox fills, then waits for space. Upstream PUB/SUB can still
+lose messages during that wait. The buffer can reject new intake at capacity. [Persistence details](STORAGE.md)
 
 ## Deployment scope
 

@@ -53,7 +53,7 @@ flowchart LR
 ```
 
 Live stages use bounded queues and best-effort PUB/SUB. Durable delivery begins
-at the row builder's persistent delivery journal. Backend HTTP retries remain
+when the row builder commits an input batch to its SQLite inbox, before building rows. Backend HTTP retries remain
 at least once. [Read the delivery boundaries](docs/ARCHITECTURE.md#delivery-boundaries).
 
 ## Get a device running

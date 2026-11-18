@@ -32,6 +32,7 @@ class Subscriber(threading.Thread):
                         socket.connect(source.endpoint)
                         poller.register(socket, zmq.POLLIN)
                     while not self.stop.is_set():
+                        ready = []
                         for socket, _ in poller.poll(100):
                             key = sockets[socket]
                             parts = socket.recv_multipart()
@@ -45,7 +46,7 @@ class Subscriber(threading.Thread):
                                     else alerts.decode(parts)
                                 )
                                 self.builder.validate_input(batch)
-                                self.inbox.put(key, batch, len(parts[1]))
+                                ready.append((key, batch, parts[1]))
                             except (ValueError, TypeError, KeyError, UnicodeError):
                                 self.inbox.reject(key)
                                 log.warning(
@@ -56,6 +57,8 @@ class Subscriber(threading.Thread):
                                         "fields": {"input": key},
                                     },
                                 )
+                        if ready:
+                            self.inbox.put_ready(ready, self.stop)
                 finally:
                     for socket in sockets:
                         socket.close(linger=0)

@@ -16,6 +16,7 @@ from ..messaging.subscriber import Subscriber
 from ..processing.worker import Inbox, RowWorker
 from ..processing.builder import RowBuilder
 from .delivery import Journal, Delivery
+from .inbox import DurableInbox
 
 log = logging.getLogger("row_builder")
 
@@ -61,6 +62,9 @@ def parser():
     result.add_argument("--buffer-connect", help="Acknowledged buffer RPC endpoint")
     result.add_argument(
         "--delivery-path", type=Path, default=Path("data/row-delivery.db")
+    )
+    result.add_argument(
+        "--inbox-max-bytes", type=positive_int, default=100 * 1024 * 1024
     )
     result.add_argument("--delivery-max-items", type=positive_int, default=1000)
     result.add_argument("--delivery-max-bytes", type=positive_int, default=4_194_304)
@@ -175,8 +179,6 @@ def run(args):
     stop = threading.Event()
     device = load_device(args.config) if args.monitor_input else None
     builder = RowBuilder(cameras, models, rules, device=device)
-    inbox = Inbox(inputs, args.max_items, args.max_bytes, args.max_age_ms)
-    subscriber = Subscriber(inputs, builder, inbox, stop)
     journal = None
     delivery = None
     if args.buffer_connect:
@@ -192,6 +194,10 @@ def run(args):
             timeout_ms=args.buffer_timeout_ms,
             retry_seconds=args.buffer_retry_seconds,
         )
+        inbox = DurableInbox(inputs, args.max_items, journal, args.inbox_max_bytes)
+    else:
+        inbox = Inbox(inputs, args.max_items, args.max_bytes, args.max_age_ms)
+    subscriber = Subscriber(inputs, builder, inbox, stop)
     worker = RowWorker(
         builder,
         inputs,
@@ -252,7 +258,8 @@ def run(args):
                 else "stopped",
             },
         )
-        if journal and not worker.is_alive() and not delivery.is_alive():
+        if journal and not any(t.is_alive() for t in (subscriber, worker, delivery)):
+            inbox.close()
             journal.close()
     return code or int(
         bool(worker.error or subscriber.error or (delivery and delivery.error))
